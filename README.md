@@ -34,10 +34,10 @@ Specify the task by `-t`, the gpu device by `-g`, the client IP by `--client_ip`
 Configure other experiment hyperparameters as needed (e.g., `--distill`, `--scaling`. See `run_server.py` for details).
 ```
 # CIFAR-10
-python run_server.py -t cifar10 -g 6 --distill --scaling width --client_ip xxx.xxx.xx.xxx --cp 8361
+python run_server.py -t cifar10 -g 0 --client_ip xxx.xxx.xx.xxx --cp 8361
 
 # CIFAR-100
-python run_server.py -t cifar100 -g 6 --distill --scaling width --client_ip xxx.xxx.xx.xxx --cp 8361
+python run_server.py -t cifar100 -g 0 --client_ip xxx.xxx.xx.xxx --cp 8361
 ```
 
 [//]: # (## Citation)
