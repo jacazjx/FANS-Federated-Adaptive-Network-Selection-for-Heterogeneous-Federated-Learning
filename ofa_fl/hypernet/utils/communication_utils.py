@@ -8,6 +8,8 @@ def recv(soc, buffer_size=1024, recv_timeout=10):
     # get message length
     try:
         soc.settimeout(recv_timeout)
+        soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        soc.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size)
         msg = soc.recv(buffer_size)
         msg = pickle.loads(msg)
         if msg['subject'] == 'header':
@@ -23,18 +25,17 @@ def recv(soc, buffer_size=1024, recv_timeout=10):
         print(f"An error occurred while receiving header {e}.")
         return None, 0
 
-    received_data = b""
-    #recv_rounds = math.ceil(data_len / buffer_size)
-    #for _ in tqdm(range(recv_rounds), total=recv_rounds):
-    #    print(len(received_data), '/', data_len)
-    while len(received_data) < data_len:
-        #print(len(received_data), '/', data_len, 'buffer_size', buffer_size)
+    received_data = bytearray(data_len)
+    view = memoryview(received_data)
+    total_received = 0
+    while total_received < data_len:
         try:
-            soc.settimeout(recv_timeout)
-            msg = soc.recv(buffer_size)
-            if msg == b"":
+            remaining = data_len - total_received
+            chunk_size = min(buffer_size, remaining)
+            msg = soc.recv_into(view[total_received:total_received + chunk_size])
+            if not msg:
                 break
-            received_data += msg
+            total_received += msg
         except socket.timeout:
             print(
                 f"A socket.timeout exception occurred after {recv_timeout} seconds. There may be an error or the model may be trained successfully.")
@@ -42,7 +43,7 @@ def recv(soc, buffer_size=1024, recv_timeout=10):
         except BaseException as e:
             print(f"An error occurred while receiving data {e}.")
             return None, 0
-
+    received_data = bytes(received_data)
     try:
         received_data = pickle.loads(received_data)
     except BaseException as e:
@@ -54,6 +55,8 @@ def recv(soc, buffer_size=1024, recv_timeout=10):
 
 def send(soc, msg, buffer_size=1024):
     # msg: data bytes
+    soc.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    soc.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buffer_size)
     soc.sendall(pickle.dumps({"subject": "header", "data": len(msg)}))
     soc.recv(buffer_size)
     soc.sendall(msg)

@@ -9,72 +9,67 @@ from torch.nn.parameter import Parameter
 from hypernet.utils.common_utils import get_same_padding, sub_filter_start_end, val2list, ks2list
 
 
-class DynamicLayerNorm(nn.Module):
+class DynamicLayerNorm(nn.LayerNorm):
     def __init__(self, max_features, eps=1e-12):
-        super(DynamicLayerNorm, self).__init__()
+        super(DynamicLayerNorm, self).__init__(max_features, eps)
         self.max_features = max_features
         self.eps = eps
-
-        self.layer_norm = nn.LayerNorm(max_features, eps)
 
         self.active_features = max_features
 
     def get_active_params(self, num_features):
-        gamma = self.layer_norm.gamma[:num_features]
-        beta = self.layer_norm.beta[:num_features]
-        return gamma, beta
+        weight = self.weight[:num_features]
+        bias = self.bias[:num_features]
+        return weight, bias
 
     def forward(self, x, num_features=None):
         if num_features is None:
             num_features = self.active_features
 
-        gamma, beta = self.get_active_params(num_features)
+        weight, bias = self.get_active_params(num_features)
 
-        out = F.layer_norm(x, x.size()[1:], gamma, beta, self.eps)
+        out = F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
         return out
 
     def copy_ln(self, ln):
         feature_dim = self.max_features
         active_param = ln.get_active_params(feature_dim)
-        self.layer_norm.gamma.data.copy_(active_param[0])
-        self.layer_norm.beta.data.copy_(active_param[1])
-        self.layer_norm.eps = ln.eps
-        self.to(ln.layer_norm.weight.device)
+        self.weight.data.copy_(active_param[0])
+        self.bias.data.copy_(active_param[1])
+        self.eps = ln.eps
+        self.to(ln.weight.device)
 
 
-class DynamicLinear(nn.Module):
+class DynamicLinear(nn.Linear):
     def __init__(self, max_in_features, max_out_features, bias=True):
-        super(DynamicLinear, self).__init__()
-
-        self.max_in_features = max_in_features
-        self.max_out_features = max_out_features
-        self.bias = bias
-
-        self.linear = nn.Linear(self.max_in_features, self.max_out_features, self.bias)
-
-        self.active_out_features = self.max_out_features
+        super(DynamicLinear, self).__init__(max_in_features, max_out_features, bias)
+        self.default_in_features = max_in_features
+        self.active_in_features = max_in_features
+        self.default_out_features = max_out_features
+        self.active_out_features = max_out_features
 
     def get_active_weight(self, out_features, in_features):
-        return self.linear.weight[:out_features, :in_features]
+        return self.weight[:out_features, :in_features]
 
     def get_active_bias(self, out_features):
-        return self.linear.bias[:out_features] if self.bias else None
+        return self.bias[:out_features] if self.bias is not None else None
 
     # copy from larger linear
     def copy_linear(self, linear):
-        out_features, in_features = self.max_out_features, self.max_in_features
+        out_features, in_features = self.active_out_features, self.active_in_features
         weight = linear.get_active_weight(out_features, in_features)
         bias = linear.get_active_bias(out_features)
-        self.linear.weight.data.copy_(weight)
-        if self.bias:
-            self.linear.bias.data.copy_(bias)
-        self.linear.to(linear.linear.weight.device)
+        self.default_out_features, self.default_in_features = linear.default_out_features, linear.default_in_features
+        self.weight.data.copy_(weight)
+        if self.bias is not None:
+            self.bias.data.copy_(bias)
+        self.to(linear.weight.device)
 
     def forward(self, x, out_features=None):
         if out_features is None:
             out_features = self.active_out_features
 
-        in_features = x.size(1)
+        in_features = x.size(-1)
         weight = self.get_active_weight(out_features, in_features).contiguous()
         bias = self.get_active_bias(out_features)
         y = F.linear(x, weight, bias)

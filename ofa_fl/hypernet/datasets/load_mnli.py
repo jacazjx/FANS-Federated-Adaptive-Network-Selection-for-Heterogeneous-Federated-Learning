@@ -6,6 +6,8 @@ import torch
 from torch.utils.data import Dataset, Subset
 from torch.nn.utils.rnn import pad_sequence
 from copy import deepcopy
+
+from tqdm import tqdm
 from transformers import BertTokenizerFast
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -108,7 +110,7 @@ def load_mnli(data_path, data_shares, alpha, n_large):
             random.shuffle(data_idx)
 
         usr_subset_idx = [[] for i in data_shares]
-        for usr_i, share in enumerate(data_shares):
+        for usr_i, share in enumerate(tqdm(data_shares, desc=f"Processing dataset {i+1}/{len(datasets)}")):
             if usr_i not in small_clients:
                 for c in range(num_classes):
                     if i == 0:

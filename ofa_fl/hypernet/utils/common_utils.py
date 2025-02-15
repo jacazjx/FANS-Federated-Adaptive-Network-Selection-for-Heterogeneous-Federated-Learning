@@ -12,6 +12,9 @@ __all__ = [
     "build_activation",
     "val2list",
     "get_same_padding",
+    "is_subnet",
+    "config_to_matrix",
+    "matrix_to_config",
 
     "adjust_bn_according_to_idx",
 
@@ -102,8 +105,52 @@ def get_same_padding(kernel_size):
     return kernel_size // 2
 
 
+def is_subnet(matrix_A, matrix_B):
+    for a, b in zip(matrix_A, matrix_B):
+        if a > b:
+            return False
+    return True
 
+def config_to_matrix(config, depth_list):
+    """
+    将配置转换为1D向量
+    """
+    depth = sum(depth_list)
+    matrix = np.zeros(depth)
+    if isinstance(config, dict):
+        start = 0
+        for l in range(len(config)):
+            sub_config= config[f'sublayer_{l}']
+            s_l = len(sub_config)
+            ratio = sub_config["block_0"]
+            matrix[start:start+s_l] = ratio
+            start += depth_list[l]
+    else:
+        matrix[:config[0]] = config[1]
+    return matrix
 
+def matrix_to_config(matrix: np.ndarray, depth_list, to_dict=True):
+    """
+    将1D向量转换为配置字典，并去掉值为0的块
+    """
+    if to_dict:
+        config = {}
+        start = 0
+        for l in range(len(depth_list)):
+            sublayer_name = f'sublayer_{l}'
+            sub_config = {}
+            s_l = depth_list[l]
+            for block_idx in range(s_l):
+                block_name = f'block_{block_idx}'
+                ratio = matrix[start + block_idx]
+                if ratio != 0:  # 只添加非零的块
+                    sub_config[block_name] = ratio
+            if sub_config:  # 只添加非空的子层
+                config[sublayer_name] = sub_config
+            start += s_l
+    else:
+        config = (np.count_nonzero(matrix), matrix[0])
+    return config
 
 def sub_filter_start_end(kernel_size, sub_kernel_size):
     center = kernel_size // 2

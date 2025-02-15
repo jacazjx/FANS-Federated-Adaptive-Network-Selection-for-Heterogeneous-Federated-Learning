@@ -28,8 +28,9 @@ class ClientCluster():
     def __init__(self, port):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('8.8.8.8', 80))
-            self.ip = s.getsockname()[0]
+            # s.connect(('8.8.8.8', 80))
+            # self.ip = s.getsockname()[0]
+            self.ip = "127.0.0.1"
         finally:
             s.close()
 
@@ -45,7 +46,7 @@ class ClientCluster():
         set_seed(server_args.seed)
         args.task = server_args.task
         args.total_clients = server_args.total_clients
-        args.n_large = server_args.n_large
+        args.n_large = server_args.n_full[0]
         args.classifier_name = server_args.classifier_name
         args.finetune_epochs = server_args.finetune_epochs
         args.beta = server_args.beta
@@ -67,21 +68,21 @@ class ClientCluster():
         if server_args.task.startswith('cifar'):
             from hypernet.datasets.load_cifar import load_cifar
             trainData, valData, testData = load_cifar(server_args.task, os.path.join(args.data_dir, server_args.task),
-                                                      server_args.data_shares, server_args.alpha, server_args.n_large)
+                                                      server_args.data_shares, server_args.alpha, server_args.n_full[0])
             collate_fn = None
 
         elif server_args.task == 'mnist':
             valData = [None] * server_args.total_clients
             from hypernet.datasets.load_mnist import load_mnist
             trainData, testData = load_mnist(os.path.join(args.data_dir, server_args.task), server_args.data_shares,
-                                             server_args.alpha, server_args.n_large)
+                                             server_args.alpha, server_args.n_full[0])
             collate_fn = None
 
         elif server_args.task == 'mnli':
             valData = [None] * server_args.total_clients
             from hypernet.datasets.load_mnli import load_mnli, collate_fn
             trainData, testData = load_mnli(os.path.join(args.data_dir, server_args.task, 'original'),
-                                            server_args.data_shares, server_args.alpha, server_args.n_large)
+                                            server_args.data_shares, server_args.alpha, server_args.n_full[0])
             collate_fn = collate_fn
         else:
             raise ValueError('Wrong dataset.')
@@ -154,7 +155,7 @@ class ClientCluster():
                             for cid in msg['data']['eval']['ids']:
                                 # don't update client model
                                 model_config = msg['data']['subnet_configs'][cid]
-                                model = build_model(model_config, self.clients[cid].task, self.clients[cid].n_class, args.device, args)
+                                model = self.clients[cid].base_model.get_subnet(model_config).to(args.device)
                                 recv_weights = msg['data']['eval']['model'][cid]
 
                                 missing_keys, unexpected_keys = model.load_state_dict(recv_weights, strict=False)
@@ -191,7 +192,7 @@ class Client:
         args.buffer_size = server_args.buffer_size
         set_seed(server_args.seed)
         self.task = server_args.task
-        self.is_large = id >= (server_args.total_clients - server_args.n_large)
+        self.is_large = id >= (server_args.total_clients - server_args.n_full[0])
         self.classifier_name = server_args.classifier_name
         self.device = args.device
         self.metrics = server_args.metrics
@@ -200,9 +201,9 @@ class Client:
         self.valData = valData
         self.testData = testData
         self.collate_fn = collate_fn
-
         self.n_class = server_args.n_class
 
+        self.base_model = build_model(server_args.width_ratio_list, server_args.task, server_args.n_class, args.device)
         # client features
         class_distribution = np.zeros(self.n_class)
         train_loader = DataLoader(self.trainData, batch_size=args.batch_size, shuffle=True, collate_fn=self.collate_fn,
@@ -217,12 +218,6 @@ class Client:
         self.label_mask[self.class_distribution > 0.] = 1.
 
         self.model_config = server_args.client_model_configs[id]
-        if args.task == 'mnli':
-            pass
-        elif args.task == 'cifar10':
-            from hypernet.hypernetworks.resnet import cost_budget
-        # self.model = build_model(get_model_configs(self.model_config[0]), self.task, self.n_class, self.device, args)
-        # self.model.subnet_configs.extend([get_model_configs(i) for i in self.model_config[1:]])
         self.alpha = 0.01
         self.prev_grads = 0.
 
@@ -282,147 +277,27 @@ class Client:
         return test_scores, np.mean(avg_loss)
 
     def local_update(self, args, curr_round, model_weights, model_config):
-        self.model = build_model(model_config, self.task, self.n_class, self.device, args)
-
+        self.model = self.base_model.get_subnet(model_config).to(self.device)
+        if args.task == 'mnli':
+            self.model.train_adapter("mnli")
         missing_keys, unexpected_keys = self.model.load_state_dict(model_weights, strict=False)
         if len(missing_keys) or len(unexpected_keys):
             print('Warning: missing %i missing_keys, %i unexpected_keys.' % (len(missing_keys), len(unexpected_keys)))
-        # USED FOR FedDyn
+
         train_loader = DataLoader(self.trainData, batch_size=args.batch_size, shuffle=True, collate_fn=self.collate_fn,
-                                  num_workers=4)
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr, momentum=args.momentum,
+                                  num_workers=4, pin_memory=True)
+        optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, self.model.parameters()), lr=args.lr, momentum=args.momentum,
                                     weight_decay=args.weight_decay)
         kd_criterion = KLLoss(args.temp).to(args.device)
-        # kd_criterion = nn.MSELoss()
-
-        consistency_weight_constant = max(1, round(args.rounds * args.round_alpha))
-        current = np.clip(curr_round, 0.0, consistency_weight_constant)
-        phase = 1.0 - current / consistency_weight_constant
-        consistency_weight = float(np.exp(-5.0 * phase * phase))
-
 
         local_epochs = args.epochs
         if args.warm_up and curr_round == 0:
             local_epochs = 50
         ########################################
-        # DepthFL, SD + FedDyn
-        ########################################
-        if args.algorithm == 'depthfl':
-            # DepthFL
-            for e in range(args.epochs):
-                start_time = datetime.now()
-                adjust_learning_rate(optimizer, args.lr, curr_round * args.epochs + e)
-                for sample, label in tqdm(train_loader, total=len(train_loader)):
-                    # train_one_batch
-                    criterion = nn.CrossEntropyLoss()
-                    self.model.train()
-                    label = label.to(self.device, dtype=torch.long)
-                    if len(label.shape) > 1:
-                        label = torch.argmax(label, dim=-1)
-                    optimizer.zero_grad()
-                    t_out = self.model_fit(self.model, sample)
-                    loss = criterion(t_out, label)
-                    losses = [t_out]
-                    for i, subnet_config in enumerate(self.model.subnet_configs):
-                        s_out = self.model_fit(self.model, sample, subnet_config=subnet_config)
-                        s_loss = criterion(s_out, label)
-                        losses.append(s_out)
-                        loss += s_loss
-                    kl_loss = 0
-                    for i in range(len(losses)):
-                        for j in range(len(losses)):
-                            if i != j:
-                                _kl_loss = consistency_weight * (1 / (len(losses) - 1)) * kd_criterion(losses[j],
-                                                                                                       losses[
-                                                                                                           i].detach())
-                                kl_loss += _kl_loss
-                    loss += kl_loss
-                    # FedDyn Regularization
-                    curt_param = torch.cat([p.reshape(-1) for p in self.model.parameters()])
-                    regular_loss = -torch.sum(curt_param * self.prev_grads) + args.dyn_alpha / 2 * torch.sum(
-                        (curt_param - self.recv_params) ** 2)
-                    loss += regular_loss
-                    loss.backward()
-                    optimizer.step()
-
-                end_time = datetime.now()
-                duration = (end_time - start_time).seconds / 60.
-                print('[TRAIN] Client %i, Epoch %i, Loss, %.3f, time=%.3fmins' % (
-                self.id, curr_round * args.epochs + e, loss.item(), duration))
-                # client testing
-                if e == args.finetune_epochs - 1 or (e + 1) % args.epochs == 0:  # test after fine_tune_epoch
-                    test_scores, _ = self.evaluate(args, self.model)
-                    display_results(test_scores, self.metrics)
-
-        ########################################
-        # HeteroFL, sBN + MCEL + Scaler
-        ########################################
-        elif args.algorithm == 'heterofl':
-            for e in range(local_epochs):
-                start_time = datetime.now()
-                adjust_learning_rate(optimizer, args.lr, curr_round * args.epochs + e)
-                for sample, label in tqdm(train_loader, total=len(train_loader)):
-                    criterion = nn.CrossEntropyLoss()
-                    self.model.train()
-                    label = label.to(self.device, dtype=torch.long)
-                    if len(label.shape) > 1:
-                        label = torch.argmax(label, dim=-1)
-                    optimizer.zero_grad()
-                    t_out = self.model_fit(self.model, sample)
-                    t_out.masked_fill(self.label_mask == 0, 0)  # MCEL
-                    loss = criterion(t_out, label)
-                    loss.backward()
-                    optimizer.step()
-                    self.train_one_batch(self.model, sample, label, optimizer, criterion)
-                end_time = datetime.now()
-                duration = (end_time - start_time).seconds / 60.
-                print('[TRAIN] Client %i, Epoch %i, Loss, %.3f, time=%.3fmins' % (
-                    self.id, curr_round * args.epochs + e, loss.item(), duration))
-                # client testing
-                if e == args.finetune_epochs - 1 or (e + 1) % args.epochs == 0:  # test after fine_tune_epoch
-                    test_scores, _ = self.evaluate(args, self.model)
-                    display_results(test_scores, self.metrics)
-
-        ########################################
-        # ScaleFL, sBN? + Scaler + SD
-        ########################################
-        elif args.algorithm == 'scalefl':
-            for e in range(local_epochs):
-                start_time = datetime.now()
-                adjust_learning_rate(optimizer, args.lr, curr_round * args.epochs + e)
-                for sample, label in tqdm(train_loader, total=len(train_loader)):
-                    # train_one_batch
-                    criterion = nn.CrossEntropyLoss()
-                    n = len(self.model.subnet_configs) + 1
-                    self.model.train()
-                    label = label.to(self.device, dtype=torch.long)
-                    if len(label.shape) > 1:
-                        label = torch.argmax(label, dim=-1)
-                    optimizer.zero_grad()
-                    t_out = self.model_fit(self.model, sample)
-                    loss = criterion(t_out, label) * n
-                    for i, subnet_config in enumerate(self.model.subnet_configs):
-                        s_out = self.model_fit(self.model, sample, subnet_config=subnet_config)
-                        kl_loss = kd_criterion(s_out, t_out.detach())
-                        loss += (kl_loss * args.beta + criterion(s_out, label)) * (n - i - 1)
-                    loss /= n * (n + 1) / 2
-                    loss.backward()
-                    optimizer.step()
-
-                end_time = datetime.now()
-                duration = (end_time - start_time).seconds / 60.
-                print('[TRAIN] Client %i, Epoch %i, Loss, %.3f, time=%.3fmins' % (
-                    self.id, curr_round * args.epochs + e, loss.item(), duration))
-                # client testing
-                if e == args.finetune_epochs - 1 or (e + 1) % args.epochs == 0:  # test after fine_tune_epoch
-                    test_scores, _ = self.evaluate(args, self.model)
-                    display_results(test_scores, self.metrics)
-
-        ########################################
-        # FANS, sBN? + Scaler + SD
+        # FANS, SD
         ########################################
         elif args.algorithm == 'fans':
-            self.model.re_organize_weights()
+
             for e in range(local_epochs):
                 start_time = datetime.now()
                 adjust_learning_rate(optimizer, args.lr, curr_round * args.epochs + e)
@@ -441,13 +316,7 @@ class Client:
                     for i, subnet_config in enumerate(subnet_configs):
                         s_out = self.model_fit(self.model, sample, subnet_config=subnet_config)
                         kl_loss = kd_criterion(s_out, t_out.detach())
-                        loss += ((1/n) * kl_loss * args.beta + (1/n) * (1-args.beta) * criterion(s_out, label))
-                    # FedDyn Regularization
-                    if args.fed_dyn:
-                        curt_param = torch.cat([p.reshape(-1) for p in self.model.parameters()])
-                        regular_loss = -torch.sum(curt_param * self.prev_grads) + args.dyn_alpha / 2 * torch.sum(
-                            (curt_param - self.recv_params) ** 2)
-                        loss += regular_loss
+                        loss += ((kl_loss * args.beta + (1-args.beta) * criterion(s_out, label)) / n)
                     loss.backward()
                     optimizer.step()
 
@@ -459,21 +328,10 @@ class Client:
                 if e == args.finetune_epochs - 1 or (e + 1) % args.epochs == 0:  # test after fine_tune_epoch
                     test_scores, _ = self.evaluate(args, self.model)
                     display_results(test_scores, self.metrics)
-        else:  # standalone
-            for e in range(args.epochs * args.rounds):
-                start_time = datetime.now()
-                adjust_learning_rate(optimizer, args.lr, curr_round * args.epochs + e)
-                for sample, label in tqdm(train_loader, total=len(train_loader)):
-                    criterion = nn.CrossEntropyLoss()
-                    self.train_one_batch(self.model, sample, label, optimizer, criterion)
-                end_time = datetime.now()
-                duration = (end_time - start_time).seconds / 60.
-                print('[TRAIN] Client %i, Epoch %i, time=%.3fmins' % (self.id, curr_round * args.epochs + e, duration))
-                # client testing
-                if e == args.finetune_epochs - 1 or (e + 1) % args.epochs == 0:  # test after fine_tune_epoch
-                    test_scores, _ = self.evaluate(args, self.model)
-                    display_results(test_scores, self.metrics)
+
         updated_weights = OrderedDict({k: p.cpu() for k, p in self.model.state_dict().items()})
+        del self.model
+        torch.cuda.empty_cache()
         return updated_weights, test_scores
 
     # train model one round with only , without changing self.model value

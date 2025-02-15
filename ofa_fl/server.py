@@ -4,14 +4,18 @@ import random
 import socket
 import threading
 import time
+
 from collections import defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-
-from hypernet.hypernetworks.resnet import super_resnet18, cost_budget
-from hypernet.utils.common_utils import SuperWeightAveraging, convert_model_to_dict
+from tqdm import tqdm
+from hypernet.hypernetworks.bert import super_bert_base
+from hypernet.hypernetworks.resnet import super_resnet18, super_resnet101
+from hypernet.hypernetworks.densenet import super_densenet121
+from hypernet.utils.common_utils import SuperWeightAveraging, convert_model_to_dict, is_subnet, config_to_matrix, matrix_to_config
 from hypernet.utils.communication_utils import recv, send
 
 EPS = 1e-7
@@ -19,8 +23,9 @@ class Server():
     def __init__(self, args):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('8.8.8.8', 80))
-            self.ip = s.getsockname()[0]
+            # s.connect(('8.8.8.8', 80))
+            # self.ip = s.getsockname()[0]
+            self.ip = "127.0.0.1"
         finally:
             s.close()
 
@@ -42,10 +47,80 @@ class Server():
             args.classifier_name = 'output_layer'
 
         if args.task == 'cifar10':
-            self.hypernet = super_resnet18(True, args.use_scaler, args.width_ratio_list)
+            self.hypernet = super_resnet18(True, args.use_scaler, args.width_ratio_list, num_classes=10)
         elif args.task == 'cifar100':
-            pass
+            self.hypernet = super_densenet121(width_pruning_ratio_list=args.width_ratio_list, num_classes=100)
+        elif args.task == "mnli":
+            self.hypernet = super_bert_base(width_pruning_ratio_list=args.width_ratio_list, num_classes=3)
+        else:
+            raise ValueError('Wrong task!!!:', args.task)
 
+        if args.algorithm == "fans":
+            if os.path.exists(f"{args.save_dir}/client_config"):
+                self.client_model_configs = torch.load(f"{args.save_dir}/client_config")
+            else:
+                all_subnet_configs = self.hypernet.generate_all_subnet_configs()
+                print("Start to execute budgets...")
+                all_subnet_budget = []
+                all_subnet_matrix = []
+
+                # 计算每个线程需要处理的配置数量
+                num_configs = len(all_subnet_configs)
+                num_threads = 10
+                configs_per_thread = num_configs // num_threads
+
+                # 将all_subnet_configs分成十个子列表
+                config_chunks = [all_subnet_configs[i * configs_per_thread:(i + 1) * configs_per_thread] for i in range(num_threads)]
+                if num_configs % num_threads != 0:
+                    config_chunks[-1].extend(all_subnet_configs[num_threads * configs_per_thread:])
+
+                def process_config_chunk(config_chunk, hypernet):
+                    results = []
+                    for config in config_chunk:
+                        matrix = config_to_matrix(config, hypernet.BASE_DEPTH_LIST)
+                        cost = torch.sum(torch.tensor(matrix) * hypernet.layer_cost)
+                        results.append((matrix, cost))
+                    return results
+
+                # 使用ThreadPoolExecutor并行处理这些子列表
+                with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                    futures = {executor.submit(process_config_chunk, config_chunk, self.hypernet): config_chunk for config_chunk in config_chunks}
+                    for future in tqdm(as_completed(futures), total=len(futures), desc="Processing config chunks"):
+                        for matrix, cost in future.result():
+                            if cost in all_subnet_budget:
+                                continue
+                            all_subnet_matrix.append(matrix)
+                            all_subnet_budget.append(cost)
+
+                # 根据 all_subnet_budget 对 all_subnet_matrix 和 all_subnet_budget 进行同步排序
+                sorted_indices = sorted(range(len(all_subnet_budget)), key=lambda k: all_subnet_budget[k])
+                all_subnet_matrix = [all_subnet_matrix[i] for i in sorted_indices]
+                all_subnet_budget = [all_subnet_budget[i] for i in sorted_indices]
+
+                cache = {}
+                for (client, budget) in self.client_model_configs.items():
+                    if budget in cache.keys():
+                        self.client_model_configs[client] = cache[budget]
+                        continue
+                    subnet_configs = []
+                    for cost, matrix in zip(all_subnet_budget, all_subnet_matrix):
+                        if cost <= (budget + 1e-7):
+                            subnet_configs.append(matrix)
+                    non_subnets = []
+                    print(f"Searching largest configs for Client {client} with constraint {budget}")
+                    for i, config in enumerate(subnet_configs):
+                        is_sub = False
+                        for j, other_config in enumerate(subnet_configs):
+                            if i != j and is_subnet(config, other_config):
+                                is_sub = True
+                                break
+                        if not is_sub:
+                            non_subnets.append(config)
+                    non_subnets = [matrix_to_config(config, self.hypernet.BASE_DEPTH_LIST, True if args.task != 'mnli' else False) for config in non_subnets]
+                    self.client_model_configs[client] = non_subnets
+                    cache[budget] = non_subnets
+
+        torch.save(self.client_model_configs, f"{args.save_dir}/client_config")
         self.aggregate_tool = SuperWeightAveraging(self.hypernet, args.dyn_alpha, args.fed_dyn)
         self.alpha = args.round_alpha
         self.beta = args.round_beta
@@ -61,10 +136,6 @@ class Server():
         # train: ask client to train model and return the model parameter
         # update: send the updated model to the client
         # stop: ask client to stop training and close connection
-        if args.task == 'cifar10':
-            unweighted = False
-        else:
-            unweighted = True
 
         self.logger.debug('---Start Registration---')
         threads = {}
@@ -101,14 +172,15 @@ class Server():
         # 计算每个阶段的round数
         total_rounds = args.rounds
         alpha_rounds = int(total_rounds * self.alpha)
-        last_model_config = {c: f"1_1_{min(args.width_ratio_list)}" for c in self.client_model_configs.keys()}
+
         for r in range(args.rounds + 1):
+            self.global_round = r
             start_time = time.time()
 
             # large device always join the round
             selected_clients = sorted(np.random.permutation(list(
-                self.client_addr.keys())[:args.total_clients - args.n_large])[:args.sample_clients])
-            selected_clients.extend(list(range(args.total_clients - args.n_large, args.total_clients)))
+                self.client_addr.keys())[:args.total_clients - args.n_full[0]])[:args.sample_clients])
+            selected_clients.extend(list(range(args.total_clients - args.n_full[0], args.total_clients)))
 
             if r == args.rounds:
                 selected_clients = []
@@ -120,24 +192,12 @@ class Server():
             threads = {}
             for cluster in self.client_clusters:
                 train_clients = [c for c in selected_clients if c in self.client_clusters[cluster]]
-                eval_clients = self.client_clusters[cluster] - set(train_clients)
+                # eval_clients = self.client_clusters[cluster] - set(train_clients)
 
-                if r < alpha_rounds:
-                    # Stage 2: 执行弹性扩大
-                    self.logger.debug('Stage 1: Training with progressive model settings')
-                    subnet_configs = {c: cost_budget(get_progressive_configs(last_model_config[c],
-                                                                             self.client_model_configs[c][c],
-                                                                             args.width_ratio_list))
-                                      for c in train_clients}
-                else:
-                    # Stage 1: 训练最大模型设置
-                    self.logger.debug('Stage 2: Training with maximum model settings')
-                    subnet_configs = {c: cost_budget(random.choice(self.client_model_configs[c])) for c in
-                                      train_clients}
+                subnet_configs = {c: random.choice(self.client_model_configs[c]) for c in train_clients}
 
 
-                # train_clients
-                self.hypernet.train()
+
                 if r != 0 and args.standalone:
                     init_client_weights.update({c: OrderedDict([]) for c in train_clients})
                 else:
@@ -146,17 +206,6 @@ class Server():
                         for c in train_clients}
                     init_client_weights.update(init_cluster_weights)
 
-                # eval_clients
-                self.hypernet.eval()
-                with torch.no_grad():
-                    if r != 0 and args.standalone:
-                        eval_client_weights.update({c: OrderedDict([]) for c in eval_clients})
-                    else:
-                        # calculate grad for regularization in server_update
-                        eval_model_weights = {
-                            c: convert_model_to_dict(self.hypernet.get_subnet(subnet_configs[c]), args.trs)
-                            for c in eval_clients}
-                        eval_client_weights.update(eval_model_weights)
 
                 # model_weight - {global_key_idx: weight}
                 send_msg = {
@@ -168,7 +217,7 @@ class Server():
                             "model": init_client_weights
                         },
                         "eval": {
-                            "ids": eval_clients,
+                            "ids": [],
                             "model": eval_client_weights
                         },
                         "subnet_configs": subnet_configs
@@ -206,7 +255,7 @@ class Server():
                 data_ratio_list = torch.tensor(data_ratio_list)
                 self.aggregate_tool.aggregate(model_list, None)
                 # 保存
-                torch.save(self.hypernet.state_dict(), os.path.join(args.save_dir, "hypernet.pth"))
+                torch.save(self.hypernet, os.path.join(args.save_dir, "hypernet.pth"))
 
             self.logger.debug('Model Aggregation')
 
@@ -215,13 +264,8 @@ class Server():
             avg_scores = {'small': {}, 'large': {}}
 
             # 打印准确率，准确率测试是在客户端进行的
-            for metric in self.metrics:
-                avg_scores['small'][metric] = np.average(
-                    [client_response[c]['score'][metric] for c in range(args.total_clients - args.n_large)])
-                avg_scores['large'][metric] = np.average([client_response[c]['score'][metric] for c in
-                                                          range(args.total_clients - args.n_large, args.total_clients)])
-            self.logger.critical('[TRAIN] Round %i, time=%.3fmins, ACC-small=%.4f, ACC-large=%.4f' % (
-                r, duration, avg_scores['small']['ACC'], avg_scores['large']['ACC']))
+
+            self.logger.critical('[TRAIN] Round %i, time=%.3fmins' % (r, duration))
             for c in client_response:
                 self.logger.critical({c: {m: round(client_response[c]['score'][m], 4) for m in self.metrics}})
             if args.standalone:

@@ -24,14 +24,24 @@ def main(args):
     args.save_dir = save_dir
     set_seed(args.seed)
 
-    # 固定比例large 0.2 medium 0.3 small 0.5
+
     # 生成一组设备数量以及数据分布
-    device_distribution, data_shares = gen_data_shares(args.total_clients-args.n_large, args.n_large)
-    if args.all_small:
-        device_distribution = {
-            "small": args.total_clients
-        }
-        data_shares = [1. / args.total_clients] * args.total_clients
+    data_shares = []
+    device_distribution = {
+        "small": args.n_small[0],
+        "medium": args.n_medium[0],
+        "large": args.n_large[0],
+        "server": args.n_full[0]
+    }
+    for i in range(args.n_small[0]):
+        data_shares.append(args.n_small[1]/100)
+    for i in range(args.n_medium[0]):
+        data_shares.append(args.n_medium[1]/100)
+    for i in range(args.n_large[0]):
+        data_shares.append(args.n_large[1]/100)
+    for i in range(args.n_full[0]):
+        data_shares.append(args.n_full[1]/100)
+
 
     args.data_shares = data_shares
     assert round(np.sum(args.data_shares), 2) == 1., args.data_shares
@@ -76,11 +86,11 @@ def main(args):
             "large":    ["3_2_0.75"],
             "server":   ["4_2_1"]
         },
-        "fans": {       #DepthFL,  HeteroFL ,  ScaleFL
-            "small":    ["1_2_1", "4_2_0.25", "1_2_0.25"],
-            "medium":   ["2_2_1", "4_2_0.5",  "2_2_0.5"],
-            "large":    ["3_2_1", "4_2_0.75", "3_2_0.75"],
-            "server":   ["4_2_1"]
+        "fans": {               #DepthFL,  HeteroFL ,  ScaleFL
+            "small":    0.125,  #["1_2_1", "4_2_0.25", "1_2_0.25"],
+            "medium":   0.25,   #["2_2_1", "4_2_0.5",  "2_2_0.5"],
+            "large":    0.5,    #["3_2_1", "4_2_0.75", "3_2_0.75"],
+            "server":   1       #["4_2_1"]
         },
         "standalone": {
             "small":    ["1_2_0.25"],
@@ -94,28 +104,27 @@ def main(args):
         args.client_model_configs = {}
         # server
         idx = 0
-        config_sets = set()
         for name, num in device_distribution.items():
             for _ in range(num):
-                if args.runtime_random:
-                    args.client_model_configs[idx] = model_configs[args.algorithm][name]
-                else:
-                    args.client_model_configs[idx] = [random.choice(model_configs[args.algorithm][name])]
+                args.client_model_configs[idx] = model_configs[args.algorithm][name]
                 idx += 1
 
     elif args.task == 'cifar100':
-        small_model_name = 'DenseNet_1block' if args.scaling == 'depth' else 'DenseNet121_scaled'
-        args.client_model_names = {i: [small_model_name] for i in range(args.total_clients - 1)}
-        for i in range(args.n_large):
-            args.client_model_names[args.total_clients - args.n_large + i] = ['DenseNet121', small_model_name]
-    # elif args.task == 'mnist':
-    #     args.client_model_names = {i: ['LeNet5_dwscaled'] for i in range(args.total_clients - 1)}
-    #     for i in range(args.n_large):
-    #         args.client_model_names[args.total_clients - args.n_large + i] = ['LeNet5', 'LeNet5_dwscaled']
+        args.client_model_configs = {}
+        # server
+        idx = 0
+        for name, num in device_distribution.items():
+            for _ in range(num):
+                args.client_model_configs[idx] = model_configs[args.algorithm][name]
+                idx += 1
     elif args.task == 'mnli':
-        args.client_model_names = {i: ['DistilBERT'] for i in range(args.total_clients - 1)}
-        for i in range(args.n_large):
-            args.client_model_names[args.total_clients - args.n_large + i] = ['BERT', 'DistilBERT']
+        args.client_model_configs = {}
+        # server
+        idx = 0
+        for name, num in device_distribution.items():
+            for _ in range(num):
+                args.client_model_configs[idx] = model_configs[args.algorithm][name]
+                idx += 1
 
     args.metrics = ['ACC']
 
@@ -136,6 +145,10 @@ def main(args):
 
     for client_id, (client_ip, client_port) in client_addr.items():
         server.register_client(client_id, client_ip, client_port)
+
+    # 初始化检查点路径
+    checkpoint_path = os.path.join(save_dir, "training_checkpoint.pth")
+
 
     server.train(args)
 
@@ -176,7 +189,7 @@ def parse_args():
     parser.add_argument('--all_small', action='store_true', help="ALL Small client")
     parser.add_argument('--standalone', action='store_true', help="client run standalone")
     parser.add_argument('--warm_up', action='store_true', help="warm up")
-    parser.add_argument('--runtime_random', action='store_true', help="random choice model config at runtime")
+    # parser.add_argument('--runtime_random', action='store_true', help="random choice model config at runtime")
     # model name
     parser.add_argument('--algorithm', type=str, choices=["scalefl", "depthfl", "fans", "heterofl", "standalone"], default="fans",
                         help="algorithms")
@@ -203,38 +216,47 @@ if __name__ == '__main__':
 
     if args.task == 'cifar10':
         args.rounds = 50
-        args.n_large = 1
+        args.batch_size = 128
+        args.epochs = 5
         args.lr = 0.1
         args.momentum = 0.9
-        args.weight_decay = 4e-4
+        args.weight_decay = 1e-4
+        args.width_ratio_list = [1, 0.75, 0.5, 0.25]
     elif args.task == 'cifar100':
         args.rounds = 500
-        args.n_large = 1
+        args.batch_size = 128
+        args.epochs = 5
         args.lr = 0.1
         args.momentum = 0.9
-        args.weight_decay = 5e-4
+        args.weight_decay = 1e-4
+        args.width_ratio_list = [1, 0.5]
     elif args.task == 'mnli':
-        args.rounds = 500
-        args.n_large = 1
+        args.rounds = 50
+        args.batch_size = 128
+        args.epochs = 1
         args.lr = 3e-5
         args.momentum = 0.9
         args.weight_decay = 1e-4
+        args.width_ratio_list = [1, 0.75, 0.5, 0.25]
 
-    if args.n_large is None:  # default
-        if args.task == 'cifar10':
-            args.n_large = 1
-        elif args.task == 'cifar100':
-            args.n_large = 1
-        elif args.task == 'mnli':
-            args.n_large = 1
+    if args.task == 'cifar10':
+        args.n_full = (1, 50)
+        args.n_large = (1, 20)
+        args.n_medium = (2, 10)
+        args.n_small = (5, 2)
+    elif args.task == 'cifar100':
+        args.n_full = (1, 50)
+        args.n_large = (2, 5)
+        args.n_medium = (5, 2)
+        args.n_small = (30, 1)
+    elif args.task == 'mnli':
+        args.n_full = (1, 50)
+        args.n_large = (2, 10)
+        args.n_medium = (4, 5)
+        args.n_small = (10, 1)
 
-    if args.total_clients is None:  # default
-        if args.task == 'cifar10':
-            args.total_clients = 5+args.n_large
-        elif args.task == 'cifar100':
-            args.total_clients = 50+args.n_large
-        elif args.task == 'mnli':
-            args.total_clients = 10+args.n_large
+
+    args.total_clients = args.n_full[0] + args.n_large[0] + args.n_medium[0] + args.n_small[0]
 
     if args.algorithm == 'heterofl':
         args.fed_dyn = False
@@ -263,7 +285,6 @@ if __name__ == '__main__':
         args.beta = 0.6
         args.round_alpha = 0
         args.round_beta = 1
-        args.width_ratio_list = [1, 0.5, 0.25, 0.125]
         args.use_scaler = False
         args.trs = True
     else:
@@ -274,8 +295,8 @@ if __name__ == '__main__':
 
     client_clusters = [(args.client_ip, int(p)) for p in args.cp]
 
-    client_addr = {i: client_clusters[i % len(client_clusters)] for i in range(args.total_clients - args.n_large)}
-    for i in range(args.n_large):
-        client_addr[args.total_clients - args.n_large + i] = client_clusters[-((i + 1) % len(client_clusters))]
+    client_addr = {i: client_clusters[i % len(client_clusters)] for i in range(args.total_clients - args.n_full[0])}
+    for i in range(args.n_full[0]):
+        client_addr[args.total_clients - args.n_full[0] + i] = client_clusters[-((i + 1) % len(client_clusters))]
 
     main(args)

@@ -3,11 +3,12 @@ import torch
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from transformers import BertTokenizerFast, AutoAdapterModel
-from .hypernetworks import resnet, bert, vgg, densenet
+from .hypernetworks import resnet, bert, densenet
 
 
 # trs = False means use static BatchNorm
-def build_model(model_config, task, n_class, device, args):
+
+def build_model(width_ratio_list, task, n_class, device):
     if task.startswith('cifar'):
         dummy_input = torch.randn(1, 3, 32, 32, device=device)
     elif task == 'mnist':
@@ -23,29 +24,13 @@ def build_model(model_config, task, n_class, device, args):
         dummy_input = (pair_token_ids, segment_ids, attention_mask_ids)
 
     if task == "cifar10":
-        model = resnet.super_resnet18(True, args.use_scaler, args.width_ratio_list).get_subnet(model_config).to(device)
+        model = resnet.super_resnet18(True, False, width_ratio_list, num_classes=n_class)
 
+    elif task == "cifar100":
+        model = densenet.super_densenet121(width_pruning_ratio_list=width_ratio_list, num_classes=n_class)
 
-
-    # if model_config == 'ResNet18':
-    #     model = resnet.SuperResnet(resnet.DynamicBasicBlock,
-    #                                4,
-    #                                [2, 2, 4, 2],
-    #                                [64, 128, 256, 512],
-    #                                dummy_input.size(),
-    #                                n_class,
-    #                                [0.0, 0.125, 0.25, 0.5]
-    #     )
-    # elif model_config == 'DenseNet121':
-    #     model = densenet.DenseNet121(n_class)
-    # elif model_config == 'BERT':
-    #     model = AutoAdapterModel.from_pretrained('bert-base-uncased')
-    #     model.add_adapter("mnli")
-    #     model.add_classification_head("mnli", num_labels=n_class)
-    #     model.active_adapters = "mnli"
-    # else:
-    #     raise ValueError('Wrong model name:', model_config)
-
+    else:
+        model = bert.super_bert_base(width_pruning_ratio_list=width_ratio_list, num_classes=n_class)
 
     model.dummy_input = dummy_input
 

@@ -73,11 +73,11 @@ def gen_data_shares(num_clients, num_servers=1):
     medium_ratio = 0.3  # 中型设备占 30%
     small_ratio = 0.5  # 小型设备占 50%
 
-    # 设备复杂度
-    server_complexity = 10
-    large_complexity = 5
-    medium_complexity = 3
+    server_complexity = 20
+    large_complexity = 10
+    medium_complexity = 5
     small_complexity = 2
+
 
     # 客户端类型划分
     num_large_clients = int(num_clients * large_ratio)
