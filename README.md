@@ -32,16 +32,27 @@ python run_client.py --port 8361 -g 6
 2. Start the training on server. 
 Specify the task by `-t`, the gpu device by `-g`, the client IP by `--client_ip` (replace `xxx.xxx.xx.xxx` with the IP obtained from the first step), the client ports by `--cp` (should match the ports used in the first step).
 Configure other experiment hyperparameters as needed (e.g., `--distill`, `--scaling`. See `run_server.py` for details).
-For example, to launch server training on CIFAR-10 using GPU 6, run:
 ```
-python run_server.py -t cifar10 -g 6 --distill --scaling width --client_ip xxx.xxx.xx.xxx --cp 8361 --cp 8362
+# CIFAR-10
+python run_server.py -t cifar10 -g 6 --distill --scaling width --client_ip xxx.xxx.xx.xxx --cp 8361
+
+# CIFAR-100
+python run_server.py -t cifar100 -g 6 --distill --scaling width --client_ip xxx.xxx.xx.xxx --cp 8361
 ```
 
-## Citation
-Please cite the following paper if you found our framework useful. Thanks!
+[//]: # (## Citation)
 
+[//]: # (Please cite the following paper if you found our framework useful. Thanks!)
 
+And the follows are the references of the code and the paper.
 ## References
 ```
+@inproceedings{zhang2024few,
+  title={How Few Davids Improve One Goliath: Federated Learning in Resource-Skewed Edge Computing Environments},
+  author={Zhang, Jiayun and Li, Shuheng and Huang, Haiyu and Wang, Zihan and Fu, Xiaohan and Hong, Dezhi and Gupta, Rajesh K and Shang, Jingbo},
+  booktitle={Proceedings of the ACM on Web Conference 2024},
+  pages={2976--2985},
+  year={2024}
+}
 
 ```
