@@ -1,4 +1,4 @@
-# RecipFL
+# FANS
 
 FANS: Federated Adaptive Network Selection for Heterogeneous Federated Learning. ICML 2025. 
 [[paper]( )][[video]( )]
