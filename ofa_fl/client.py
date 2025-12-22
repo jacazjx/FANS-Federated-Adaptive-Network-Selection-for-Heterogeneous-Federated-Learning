@@ -14,7 +14,7 @@ from datetime import datetime
 import socket
 
 from hypernet.utils.communication_utils import send, recv
-from hypernet.utils.common_utils import set_seed, adjust_learning_rate
+from hypernet.utils.common_utils import set_seed, adjust_learning_rate, DynamicWeightedSampler
 from tqdm import tqdm
 
 from hypernet.utils.evaluation import calculate_SLC_metrics, display_results
@@ -47,7 +47,6 @@ class ClientCluster():
         args.task = server_args.task
         args.total_clients = server_args.total_clients
         args.n_large = server_args.n_full[0]
-        args.classifier_name = server_args.classifier_name
         args.finetune_epochs = server_args.finetune_epochs
         args.beta = server_args.beta
         args.temp = server_args.temp
@@ -64,24 +63,33 @@ class ClientCluster():
         args.round_alpha = server_args.round_alpha
         args.warm_up = server_args.warm_up
         args.fed_dyn = server_args.fed_dyn
+        args.sample_way = server_args.sample_way
+        args.num_sample = server_args.num_sample
 
         if server_args.task.startswith('cifar'):
             from hypernet.datasets.load_cifar import load_cifar
-            trainData, valData, testData = load_cifar(server_args.task, os.path.join(args.data_dir, server_args.task),
+            trainData, valData, testData = load_cifar(server_args.task, os.path.join(args.data_dir, 'CIFAR'),
                                                       server_args.data_shares, server_args.alpha, server_args.n_full[0])
             collate_fn = None
 
         elif server_args.task == 'mnist':
             valData = [None] * server_args.total_clients
             from hypernet.datasets.load_mnist import load_mnist
-            trainData, testData = load_mnist(os.path.join(args.data_dir, server_args.task), server_args.data_shares,
+            trainData, testData = load_mnist(os.path.join(args.data_dir, 'MNISTS'), server_args.data_shares,
+                                             server_args.alpha, server_args.n_full[0])
+            collate_fn = None
+        
+        elif server_args.task == 'imagenet':
+            valData = [None] * server_args.total_clients
+            from hypernet.datasets.load_imagenet import load_imagenet
+            trainData, valData, testData = load_imagenet(os.path.join(args.data_dir, 'ImageNet/ilsvrc2012_64x64'), server_args.data_shares,
                                              server_args.alpha, server_args.n_full[0])
             collate_fn = None
 
         elif server_args.task == 'mnli':
             valData = [None] * server_args.total_clients
             from hypernet.datasets.load_mnli import load_mnli, collate_fn
-            trainData, testData = load_mnli(os.path.join(args.data_dir, server_args.task, 'original'),
+            trainData, testData = load_mnli(os.path.join(args.data_dir, 'MNLI/multinli_1.0/original'),
                                             server_args.data_shares, server_args.alpha, server_args.n_full[0])
             collate_fn = collate_fn
         else:
@@ -178,9 +186,20 @@ class ClientCluster():
                             send(new_socket, data_byte, args.buffer_size)
 
                             del data_byte
+
+                        elif msg['subject'] == 'stop':
+                            print("Received STOP signal from server. Shutting down...")
+                            # 发送确认消息
+                            data_byte = pickle.dumps({"subject": "stop", "data": {"status": "acknowledged"}})
+                            send(new_socket, data_byte, args.buffer_size)
+                            new_socket.close()
+                            print("Client cluster stopped successfully.")
+                            break  # 退出主循环
                 finally:
-                    new_socket.close()
-                    print(f'Close Connection with {source_addr}')
+                    if 'new_socket' in locals():
+                        new_socket.close()
+                        if msg and msg.get('subject') != 'stop':
+                            print(f'Close Connection with {source_addr}')
         finally:
             soc.close()
 
@@ -193,7 +212,6 @@ class Client:
         set_seed(server_args.seed)
         self.task = server_args.task
         self.is_large = id >= (server_args.total_clients - server_args.n_full[0])
-        self.classifier_name = server_args.classifier_name
         self.device = args.device
         self.metrics = server_args.metrics
 
@@ -278,57 +296,82 @@ class Client:
 
     def local_update(self, args, curr_round, model_weights, model_config):
         self.model = self.base_model.get_subnet(model_config).to(self.device)
-        if args.task == 'mnli':
-            self.model.train_adapter("mnli")
         missing_keys, unexpected_keys = self.model.load_state_dict(model_weights, strict=False)
         if len(missing_keys) or len(unexpected_keys):
             print('Warning: missing %i missing_keys, %i unexpected_keys.' % (len(missing_keys), len(unexpected_keys)))
 
         train_loader = DataLoader(self.trainData, batch_size=args.batch_size, shuffle=True, collate_fn=self.collate_fn,
                                   num_workers=4, pin_memory=True)
-        optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, self.model.parameters()), lr=args.lr, momentum=args.momentum,
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr, momentum=args.momentum,
                                     weight_decay=args.weight_decay)
         kd_criterion = KLLoss(args.temp).to(args.device)
-
+        criterion = nn.CrossEntropyLoss()
         local_epochs = args.epochs
         if args.warm_up and curr_round == 0:
             local_epochs = 50
         ########################################
         # FANS, SD
         ########################################
-        elif args.algorithm == 'fans':
 
-            for e in range(local_epochs):
+        # all_subnet_configs = self.model.generate_all_subnet_configs()[1:]
+        # dynamic_subnet_sampler = DynamicWeightedSampler(len(all_subnet_configs))
+
+        A = args.num_sample
+        A = min(A, 10)
+        print(f"Len of search path {A}")
+        
+        for e in range(local_epochs):
+            with tqdm(total=len(train_loader),
+                      ncols=128,
+                      desc="[TRAIN] Client [%i], Epoch [%i/%i]" % (self.id, curr_round * args.epochs + e, local_epochs)
+                      ) as t:
+                self.model.train()
                 start_time = datetime.now()
                 adjust_learning_rate(optimizer, args.lr, curr_round * args.epochs + e)
-                for idx, (sample, label) in enumerate(tqdm(train_loader, total=len(train_loader))):
-                    subnet_configs = self.model.get_progressive_subnet_configs()
+                for idx, (sample, label) in enumerate(train_loader):
+                    subnet_configs = self.model.get_progressive_subnet_configs(A, args.sample_way)
+                    # subnet_configs = [all_subnet_configs[idx] for idx in dynamic_subnet_sampler.sample(A)]
+
                     # train_one_batch
                     n = len(subnet_configs) + 1
-                    criterion = nn.CrossEntropyLoss()
-                    self.model.train()
+
                     label = label.to(self.device, dtype=torch.long)
                     if len(label.shape) > 1:
                         label = torch.argmax(label, dim=-1)
                     optimizer.zero_grad()
+                    outs = []
                     t_out = self.model_fit(self.model, sample)
-                    loss = criterion(t_out, label) / n
+                    outs.append(t_out)
+                    loss_ce = criterion(t_out, label)
+                    kl_loss = 0
                     for i, subnet_config in enumerate(subnet_configs):
                         s_out = self.model_fit(self.model, sample, subnet_config=subnet_config)
-                        kl_loss = kd_criterion(s_out, t_out.detach())
-                        loss += ((kl_loss * args.beta + (1-args.beta) * criterion(s_out, label)) / n)
+                        loss_ce += criterion(s_out, label)
+                        kl_loss += (kd_criterion(s_out, t_out.detach()) * args.beta)
+
+
+                    loss = loss_ce + kl_loss/max(1, n-1)
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     optimizer.step()
+                    # if curr_round >= (args.rounds * args.round_alpha):
+                    #     dynamic_subnet_sampler.update_weights()
 
-                end_time = datetime.now()
-                duration = (end_time - start_time).seconds / 60.
-                print('[TRAIN] Client %i, Epoch %i, Loss, %.3f, time=%.3fmins' % (
-                    self.id, curr_round * args.epochs + e, loss.item(), duration))
-                # client testing
-                if e == args.finetune_epochs - 1 or (e + 1) % args.epochs == 0:  # test after fine_tune_epoch
-                    test_scores, _ = self.evaluate(args, self.model)
-                    display_results(test_scores, self.metrics)
-
+                    end_time = datetime.now()
+                    duration = (end_time - start_time).seconds / 60.
+                    t.set_postfix(
+                        {
+                            "loss_ce": loss_ce.item(),
+                            "loss": loss.item(),
+                            "time": duration,
+                            "subnet_configs": len(subnet_configs),
+                        }
+                    )
+                    t.update(1)
+        t.close()
+        # client testing
+        test_scores, _ = self.evaluate(args, self.model)
+        display_results(test_scores, self.metrics)
         updated_weights = OrderedDict({k: p.cpu() for k, p in self.model.state_dict().items()})
         del self.model
         torch.cuda.empty_cache()

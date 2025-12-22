@@ -15,7 +15,7 @@ from tqdm import tqdm
 from hypernet.hypernetworks.bert import super_bert_base
 from hypernet.hypernetworks.resnet import super_resnet18, super_resnet101
 from hypernet.hypernetworks.densenet import super_densenet121
-from hypernet.utils.common_utils import SuperWeightAveraging, convert_model_to_dict, is_subnet, config_to_matrix, matrix_to_config
+from hypernet.utils.common_utils import SuperWeightAveraging, convert_model_to_dict, is_subnet, config_to_matrix, matrix_to_config, ModelParameterVisualizer
 from hypernet.utils.communication_utils import recv, send
 
 EPS = 1e-7
@@ -41,17 +41,14 @@ class Server():
         self.logger = args.logger
         self.client_model_configs = args.client_model_configs
 
-        if args.task == 'mnli':
-            args.classifier_name = 'heads.'
-        else:
-            args.classifier_name = 'output_layer'
-
         if args.task == 'cifar10':
             self.hypernet = super_resnet18(True, args.use_scaler, args.width_ratio_list, num_classes=10)
         elif args.task == 'cifar100':
             self.hypernet = super_densenet121(width_pruning_ratio_list=args.width_ratio_list, num_classes=100)
         elif args.task == "mnli":
             self.hypernet = super_bert_base(width_pruning_ratio_list=args.width_ratio_list, num_classes=3)
+        elif args.task == "imagenet":
+            self.hypernet = super_resnet18(True, args.use_scaler, args.width_ratio_list, num_classes=1000, input_size=(1, 3, 64, 64))
         else:
             raise ValueError('Wrong task!!!:', args.task)
 
@@ -124,7 +121,14 @@ class Server():
         self.aggregate_tool = SuperWeightAveraging(self.hypernet, args.dyn_alpha, args.fed_dyn)
         self.alpha = args.round_alpha
         self.beta = args.round_beta
-        assert self.alpha + self.beta == 1, "alpha, beta should sum up to 1"
+        # self.visualizer = ModelParameterVisualizer(self.hypernet)
+        if os.path.exists(os.path.join(args.save_dir, f"hypernet_{args.alpha}.pth")):
+            loaded_obj = torch.load(os.path.join(args.save_dir, f"hypernet_{args.alpha}.pth"))
+            if hasattr(loaded_obj, "state_dict"):
+                self.hypernet.load_state_dict(loaded_obj.state_dict())
+            else:
+                self.hypernet.load_state_dict(loaded_obj)
+
 
     def register_client(self, id, ip, port):
         self.client_addr[id] = (ip, port)
@@ -170,12 +174,12 @@ class Server():
 
         self.all_selected_clients = set()
         # 计算每个阶段的round数
-        total_rounds = args.rounds
-        alpha_rounds = int(total_rounds * self.alpha)
 
         for r in range(args.rounds + 1):
             self.global_round = r
             start_time = time.time()
+            # self.visualizer.record_parameters(epoch=r)
+            # self.visualizer.visualize_all_layers_horizontal()
 
             # large device always join the round
             selected_clients = sorted(np.random.permutation(list(
@@ -253,9 +257,9 @@ class Server():
                     data_ratio_list.append(args.data_shares[c])
             if len(selected_clients) != 0:
                 data_ratio_list = torch.tensor(data_ratio_list)
-                self.aggregate_tool.aggregate(model_list, None)
+                self.aggregate_tool.aggregate(model_list, data_ratio_list)
                 # 保存
-                torch.save(self.hypernet, os.path.join(args.save_dir, "hypernet.pth"))
+                torch.save(self.hypernet, os.path.join(args.save_dir, f"hypernet_{args.alpha}.pth"))
 
             self.logger.debug('Model Aggregation')
 
@@ -270,8 +274,32 @@ class Server():
                 self.logger.critical({c: {m: round(client_response[c]['score'][m], 4) for m in self.metrics}})
             if args.standalone:
                 break
+        # 训练完成后，发送停止信号给所有客户端集群
+        self.logger.debug('---Start Sending Stop Signal---')
+        stop_threads = {}
+        for cluster in self.client_clusters:
+            send_msg = {
+                "subject": "stop",
+                "data": {}
+            }
 
+            self.port = ((self.port - 1024) % (65535 - 1024)) + 1025
 
+            socket_thread = SocketThread(
+                addr=(self.ip, self.port),
+                client_addr=cluster,
+                send_msg=pickle.dumps(send_msg),
+                buffer_size=args.buffer_size,
+                timeout=self.timeout,
+                logger=self.logger
+            )
+            socket_thread.start()
+            stop_threads[cluster] = socket_thread
+
+        for cluster in stop_threads:
+            stop_threads[cluster].join()
+
+        self.logger.debug('---Finish Sending Stop Signal---')
 
 class SocketThread(threading.Thread):
     def __init__(self, addr, client_addr, send_msg, buffer_size=1024, timeout=10, logger=None):

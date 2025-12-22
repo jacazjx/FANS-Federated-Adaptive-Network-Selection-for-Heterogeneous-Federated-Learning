@@ -2,16 +2,18 @@ import copy
 import os
 import random
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import math
 import time
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from hypernet.base.dynamic_modules import DynamicConv2d, MyIdentity, DynamicLinear, DynamicBatchNorm2d, \
+from ..base.dynamic_modules import DynamicConv2d, MyIdentity, DynamicLinear, DynamicBatchNorm2d, \
     DynamicGroupNorm, Scaler
-from hypernet.datasets.load_cifar import get_datasets, load_cifar
-from hypernet.utils.common_utils import get_net_device, make_divisible, adjust_bn_according_to_idx
+from ..datasets.load_cifar import get_datasets, load_cifar
+from ..utils.common_utils import get_net_device, make_divisible, adjust_bn_according_to_idx
 from itertools import product
 
 class DynamicBottleneck(nn.Module):
@@ -231,77 +233,109 @@ class SuperDenseNet(nn.Module):
                 default_config[f'sublayer_{sublayer_idx}'][f'block_{block_idx}'] = max(self.width_pruning_ratio_list)
         return default_config
 
-    def get_progressive_subnet_configs(self, reverse=False):
+    # def get_progressive_subnet_configs(self, reverse=False):
+    #     subnetwork_configs = []
+    #     num_sublayers = len(self.active_output_path)
+    #     sublayer_depth_list = [len(v) for v in self.active_output_path.values()]
+    #     max_depth = max(sublayer_depth_list)
+    #     sublayer_ratio_list = [v["block_0"] for v in self.active_output_path.values()]
+    #     max_ratio = max(sublayer_ratio_list)
+    #
+    #     DepthProgressive = 0
+    #     WidthProgressive = 1
+    #     RandProgressive = 3
+    #
+    #     choices = [DepthProgressive, WidthProgressive, RandProgressive]
+    #     chosen = random.choices(choices, k=1)[0]
+    #     if chosen == DepthProgressive:
+    #         num_sublayer_list = sorted(range(num_sublayers, 0, -1), reverse=reverse)
+    #         for num_sub in num_sublayer_list:
+    #             subnetwork_config = {}
+    #             for i, (k, y) in enumerate(self.active_output_path.items()):
+    #                 if i != num_sub - 1:
+    #                     subnetwork_config[k] = self.active_output_path[k]
+    #                 else:
+    #                     num_depth_list = sorted(range(len(self.active_output_path[k]), 0, -1), reverse=reverse)
+    #                     for depth in num_depth_list:
+    #                         subnetwork_config[k] = {}
+    #                         for j, (kk, yy) in enumerate(self.active_output_path[k].items()):
+    #                             subnetwork_config[k][kk] = yy
+    #                             if j == depth - 1:
+    #                                 break
+    #                         if subnetwork_config != self.active_output_path:
+    #                             subnetwork_configs.append(subnetwork_config.copy())
+    #                 if i == num_sub - 1:
+    #                     break
+    #
+    #     elif chosen == WidthProgressive:
+    #         # Step 1: 为每个子层生成独立的可用宽度比例列表
+    #         sublayer_ratio_ranges = {}
+    #         for sublayer_name in self.active_output_path:
+    #             # 获取该子层在active_output_path中的最大比例
+    #             max_ratio_in_sublayer = max(self.active_output_path[sublayer_name].values())
+    #
+    #             # 截取允许的比例列表：从最小到该子层的最大比例
+    #             valid_ratios = [
+    #                 ratio for ratio in self.width_pruning_ratio_list
+    #                 if ratio <= max_ratio_in_sublayer
+    #             ]
+    #             sublayer_ratio_ranges[sublayer_name] = sorted(valid_ratios, reverse=False)  # 升序排列
+    #
+    #         # Step 2: 生成所有可能的组合（笛卡尔积）
+    #         all_ratio_combinations = product(
+    #             *[sublayer_ratio_ranges[f"sublayer_{i}"] for i in range(num_sublayers)]
+    #         )
+    #
+    #         # Step 3: 构建子网络配置
+    #         for ratio_combination in all_ratio_combinations:
+    #             subnetwork_config = {}
+    #             for sublayer_idx, ratio in enumerate(ratio_combination):
+    #                 sublayer_name = f"sublayer_{sublayer_idx}"
+    #                 subnetwork_config[sublayer_name] = {}
+    #                 # 保持每层块数不变，仅修改宽度比例
+    #                 for block_name in self.active_output_path[sublayer_name]:
+    #                     subnetwork_config[sublayer_name][block_name] = ratio
+    #             subnetwork_configs.append(subnetwork_config)
+    #
+    #     else:
+    #         for _ in range(5):
+    #             subnetwork_config = self.random_sample_subnet_config()
+    #             if subnetwork_config not in subnetwork_configs:
+    #                 subnetwork_configs.append(subnetwork_config)
+    #     random.shuffle(subnetwork_configs)
+    #     subnetwork_configs = subnetwork_configs[:3]
+    #
+    #     return subnetwork_configs
+    def get_progressive_subnet_configs(self, A=5, stage=0):
+
         subnetwork_configs = []
-        num_sublayers = len(self.active_output_path)
-        sublayer_depth_list = [len(v) for v in self.active_output_path.values()]
-        max_depth = max(sublayer_depth_list)
-        sublayer_ratio_list = [v["block_0"] for v in self.active_output_path.values()]
-        max_ratio = max(sublayer_ratio_list)
 
-        DepthProgressive = 0
-        WidthProgressive = 1
-        RandProgressive = 3
+        IndependentRandomSampling = 0
+        RecursiveRandomSampling = 1
+        WeightedRandomSampling = 2
 
-        choices = [DepthProgressive, WidthProgressive, RandProgressive]
-        chosen = random.choices(choices, k=1)[0]
-        if chosen == DepthProgressive:
-            num_sublayer_list = sorted(range(num_sublayers, 0, -1), reverse=reverse)
-            for num_sub in num_sublayer_list:
-                subnetwork_config = {}
-                for i, (k, y) in enumerate(self.active_output_path.items()):
-                    if i != num_sub - 1:
-                        subnetwork_config[k] = self.active_output_path[k]
-                    else:
-                        num_depth_list = sorted(range(len(self.active_output_path[k]), 0, -1), reverse=reverse)
-                        for depth in num_depth_list:
-                            subnetwork_config[k] = {}
-                            for j, (kk, yy) in enumerate(self.active_output_path[k].items()):
-                                subnetwork_config[k][kk] = yy
-                                if j == depth - 1:
-                                    break
-                            if subnetwork_config != self.active_output_path:
-                                subnetwork_configs.append(subnetwork_config.copy())
-                    if i == num_sub - 1:
-                        break
-
-        elif chosen == WidthProgressive:
-            # Step 1: 为每个子层生成独立的可用宽度比例列表
-            sublayer_ratio_ranges = {}
-            for sublayer_name in self.active_output_path:
-                # 获取该子层在active_output_path中的最大比例
-                max_ratio_in_sublayer = max(self.active_output_path[sublayer_name].values())
-
-                # 截取允许的比例列表：从最小到该子层的最大比例
-                valid_ratios = [
-                    ratio for ratio in self.width_pruning_ratio_list
-                    if ratio <= max_ratio_in_sublayer
-                ]
-                sublayer_ratio_ranges[sublayer_name] = sorted(valid_ratios, reverse=False)  # 升序排列
-
-            # Step 2: 生成所有可能的组合（笛卡尔积）
-            all_ratio_combinations = product(
-                *[sublayer_ratio_ranges[f"sublayer_{i}"] for i in range(num_sublayers)]
-            )
-
-            # Step 3: 构建子网络配置
-            for ratio_combination in all_ratio_combinations:
-                subnetwork_config = {}
-                for sublayer_idx, ratio in enumerate(ratio_combination):
-                    sublayer_name = f"sublayer_{sublayer_idx}"
-                    subnetwork_config[sublayer_name] = {}
-                    # 保持每层块数不变，仅修改宽度比例
-                    for block_name in self.active_output_path[sublayer_name]:
-                        subnetwork_config[sublayer_name][block_name] = ratio
-                subnetwork_configs.append(subnetwork_config)
-
-        else:
-            for _ in range(5):
+        '''Independent Random sample'''
+        if stage == IndependentRandomSampling:
+            for _ in range(A):
                 subnetwork_config = self.random_sample_subnet_config()
                 if subnetwork_config not in subnetwork_configs:
                     subnetwork_configs.append(subnetwork_config)
-        random.shuffle(subnetwork_configs)
-        subnetwork_configs = subnetwork_configs[:3]
+            subnetwork_configs = subnetwork_configs[:A]
+        elif stage == RecursiveRandomSampling:
+            '''Recursive Random sample'''
+            last_subnet_config = self.active_output_path
+            while True:
+                subnetwork_config = self.random_sample_subnet_config(last_subnet_config, stage)
+                if last_subnet_config == self.smallest_output_path or last_subnet_config==subnetwork_config:
+                    break
+                subnetwork_configs.append(subnetwork_config)
+                last_subnet_config = subnetwork_config
+        elif stage == WeightedRandomSampling:
+            '''Dynamic Weighted Sample'''
+            if self.dynamic_subnet_sampler is None:
+                self.all_subnet_configs = self.generate_all_subnet_configs()[1:]
+                self.dynamic_subnet_sampler = DynamicWeightedSampler(len(self.all_subnet_configs), decay_factor=0.9)
+            subnetwork_configs = [self.all_subnet_configs[idx] for idx in self.dynamic_subnet_sampler.sample(A)]
 
         return subnetwork_configs
 
@@ -330,6 +364,55 @@ class SuperDenseNet(nn.Module):
         return subnetwork_config
 
     def generate_all_subnet_configs(self):
+        all_configs = []
+
+        # 获取当前 active_output_path 的结构信息
+        current_config = self.active_output_path
+
+        num_sublayers = len(current_config)
+
+        # 每一层最多允许的 block 数量
+        max_block_num = [
+            len(current_config[f"sublayer_{i}"])
+            for i in range(num_sublayers)
+        ]
+
+        # 每一层允许的最大 width ratio
+        max_width_ratio = [
+            max(current_config[f"sublayer_{i}"].values())
+            for i in range(num_sublayers)
+        ]
+
+        def recursion_all_subnet_configs(max_sublayer, all_configs, sublayer=0, current_config=None, budget=None):
+            if current_config is None:
+                current_config = {}
+
+            if sublayer == max_sublayer:
+                all_configs.append(copy.deepcopy(current_config))
+                return
+
+            # 只能使用 ≤ 当前层数的 block 数量
+            valid_num_blocks = range(self.BASE_DEPTH_LIST[sublayer], 0, -1)
+            valid_num_blocks = [n for n in valid_num_blocks if n <= max_block_num[sublayer]]
+
+            # 只能使用 ≤ 当前最大压缩率
+            valid_ratios = [r for r in self.width_pruning_ratio_list if r <= max_width_ratio[sublayer]]
+
+            for num_blocks in valid_num_blocks:
+                for compression_rate in valid_ratios:
+                    current_config[f'sublayer_{sublayer}'] = {f'block_{block}': compression_rate for block in
+                                                              range(num_blocks)}
+                    recursion_all_subnet_configs(max_sublayer, all_configs, sublayer + 1, current_config)
+
+        # 先从最大层数开始向下搜索
+        for num_sublayer in range(self.NUM_SUBLAYER, 0, -1):
+            if num_sublayer > len(current_config):
+                continue  # 如果当前模型层数不够，则跳过更深层的枚举
+            recursion_all_subnet_configs(num_sublayer, all_configs)
+
+        return all_configs
+
+    def generate_all_subnet_configs_old(self):
         all_configs = []
         for num_sublayer in range(self.NUM_SUBLAYER, 0, -1):
             self.recursion_all_subnet_configs(num_sublayer, all_configs)
@@ -462,19 +545,19 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from hypernet.utils.evaluation import visualize_model_parameters, count_parameters
 
-def eval_all_subnets(model: SuperDenseNet, data_path):
+def eval_all_subnets(model: SuperDenseNet, data_path, csv_path):
 
     trainData, valData, testData = get_datasets("cifar100", os.path.join(data_path, "cifar100"))
     train_set, val_set, test_set = trainData, valData, testData
 
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=128, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_set, batch_size=128, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=128, shuffle=True, num_workers=5)
+    val_loader = torch.utils.data.DataLoader(val_set, batch_size=128, shuffle=False, num_workers=5)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False, num_workers=5)
 
     def fine_tuning(m):
         m.train()
         with torch.no_grad():
-            for data in test_loader:
+            for data in train_loader:
                 images, labels = data
                 images, labels = images.cuda(), labels.cuda()
                 outputs = m(images)
@@ -515,34 +598,46 @@ def eval_all_subnets(model: SuperDenseNet, data_path):
         return model_size, accuracy
 
     all_subnet_configs = model.generate_all_subnet_configs()
-    all_subnet_configs = random.choices(all_subnet_configs, k=5000)
-    all_subnet_configs.reverse()
-    results = []
-    for subnet_config in all_subnet_configs:
+    total = len(all_subnet_configs)
+    step = total // 5000 if total >= 5000 else 1  # 防止总数小于5000时出现除零错误
+    all_subnet_configs = all_subnet_configs[::step]
+
+    def evaluate_subnet(subnet_config, model):
+
         print(subnet_config)
         subnet = model.get_subnet(subnet_config)
         fine_tuning(subnet)
         model_size, accuracy = test(subnet)
-        results.append((model_size, accuracy))
+        return model_size, accuracy, subnet_config
 
-    sizes, accuracies = zip(*results)
-    pd.DataFrame({
-        "size": sizes,
-        "acc": accuracies,
-        "subnet_configs": all_subnet_configs
-    }).to_csv('result.csv')
+    max_workers = 5
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(evaluate_subnet, config, model) for config in all_subnet_configs]
+        for future in as_completed(futures):
+            try:
+                model_size, accuracy, subnet_config = future.result(timeout=10)
 
-    plt.scatter(sizes, accuracies)
-    plt.xlabel('Model Size (MB)')
-    plt.ylabel('Accuracy (%)')
-    plt.title('Model Size vs Accuracy')
-    plt.show()
+                # 单条结果转为 DataFrame
+                df = pd.DataFrame([{
+                    "size": model_size,
+                    "acc": accuracy,
+                    "subnet_configs": str(subnet_config)
+                }])
+
+                # 追加写入 CSV（header=False 表示不重复写表头）
+                df.to_csv(csv_path, mode='a', header=not os.path.exists(csv_path))
+
+                results.append((model_size, accuracy, subnet_config))
+
+            except Exception as e:
+                print(f"Task failed: {e}")
 
 if __name__ == '__main__':
     from torchinfo import summary
 
     densenet = super_densenet121(num_classes=100).cuda()
-    print(densenet)
+    print(len(densenet.generate_all_subnet_configs()))
     summary(densenet, input_size=(128, 3, 32, 32))
     data_shares = [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.02, 0.02, 0.02, 0.02, 0.02, 0.05, 0.05, 0.5]
 
@@ -631,8 +726,8 @@ if __name__ == '__main__':
         return model_size, accuracy
 
 
-    train(densenet)
-    test(densenet)
+    # train(densenet)
+    # test(densenet)
     # para = densenet.state_dict()
     # densenet.load_state_dict(torch.load("../../logs/cifar100/seed4321/hypernet.pth").state_dict())
     # test(densenet)

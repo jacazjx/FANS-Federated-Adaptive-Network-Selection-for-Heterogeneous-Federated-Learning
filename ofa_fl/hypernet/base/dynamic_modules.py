@@ -25,10 +25,10 @@ class DynamicLayerNorm(nn.LayerNorm):
     def forward(self, x, num_features=None):
         if num_features is None:
             num_features = self.active_features
-
+        normalized_shape = x.shape[-1]
         weight, bias = self.get_active_params(num_features)
 
-        out = F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+        out = F.layer_norm(x, (normalized_shape,), weight, bias, self.eps)
         return out
 
     def copy_ln(self, ln):
@@ -41,18 +41,30 @@ class DynamicLayerNorm(nn.LayerNorm):
 
 
 class DynamicLinear(nn.Linear):
-    def __init__(self, max_in_features, max_out_features, bias=True):
+    def __init__(self, max_in_features, max_out_features, bias=True, multi_head=1):
         super(DynamicLinear, self).__init__(max_in_features, max_out_features, bias)
         self.default_in_features = max_in_features
         self.active_in_features = max_in_features
         self.default_out_features = max_out_features
         self.active_out_features = max_out_features
+        self.multi_head = multi_head
 
     def get_active_weight(self, out_features, in_features):
-        return self.weight[:out_features, :in_features]
+
+        weight_chunks = torch.chunk(self.weight, int(self.multi_head))
+        out_features_per_head = out_features // self.multi_head
+
+        weight = [weight_chunks[i][:out_features_per_head, :in_features] for i in range(int(self.multi_head))]
+        return torch.cat(weight, dim=0)
 
     def get_active_bias(self, out_features):
-        return self.bias[:out_features] if self.bias is not None else None
+        if self.bias is not None:
+            bias_chunks = torch.chunk(self.bias, int(self.multi_head))
+            out_features_per_head = out_features // self.multi_head
+            bias = [bias_chunks[i][:out_features_per_head] for i in range(int(self.multi_head))]
+            return torch.cat(bias, dim=0)
+        else:
+            return None
 
     # copy from larger linear
     def copy_linear(self, linear):

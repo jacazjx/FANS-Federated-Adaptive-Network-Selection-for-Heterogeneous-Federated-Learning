@@ -1,43 +1,39 @@
 import copy
-import random
-from collections import OrderedDict
-from typing import Optional, Tuple, Union, List
 import os
-import torch.nn.functional as F
-from torch.nn import Linear, LayerNorm, Embedding
+import random
+from typing import Optional, Tuple, Union, List
+
+from torch.nn import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
+from torch.utils.tensorboard import SummaryWriter
 from transformers.activations import ACT2FN
-from transformers.adapters.composition import adjust_tensors_for_parallel, Stack, Fuse, Split, Parallel, BatchSplit
-from transformers.adapters.lora import Linear as LoRALinear
+from transformers.adapters.composition import adjust_tensors_for_parallel
 from transformers.adapters.prefix_tuning import PrefixTuningShim
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, \
-    BaseModelOutputWithPoolingAndCrossAttentions
-from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer, logger
+    BaseModelOutputWithPoolingAndCrossAttentions, SequenceClassifierOutput
+from transformers.pytorch_utils import logger
 from transformers.utils import add_start_docstrings_to_model_forward, add_code_sample_docstrings
 
-from hypernet.base.dynamic_modules import DynamicLinear, DynamicLayerNorm, MyIdentity
-from hypernet.utils.evaluation import count_parameters
+from hypernet.base.dynamic_modules import DynamicLinear, DynamicLayerNorm 
+
+from hypernet.utils.common_utils import DynamicWeightedSampler
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-import numpy as np
 import torch
-from torch import nn, Tensor
+from torch import nn
 from transformers.models.bert.modeling_bert import (
-    BertForSequenceClassification,
-    BertModel,
-    BertOutput,
-    BertIntermediate,
-    BertSelfOutput,
-    BertSelfAttention,
-    BertAttention,
-    BertLayer,
     BertEncoder,
+    BertOutput,
+    BertSelfOutput,
     BertEmbeddings,
-    BertPooler, BERT_INPUTS_DOCSTRING, _CHECKPOINT_FOR_DOC, _CONFIG_FOR_DOC
+    BERT_INPUTS_DOCSTRING,
+    _CHECKPOINT_FOR_DOC,
+    _CONFIG_FOR_DOC,
+    _CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
+    _SEQ_CLASS_EXPECTED_OUTPUT,
+    _SEQ_CLASS_EXPECTED_LOSS
 )
-from torchinfo import summary
 import math
-from transformers import BertModel, BertConfig, BertTokenizerFast, AutoAdapterModel, apply_chunking_to_forward, \
-    AutoConfig, BertAdapterModel, AdapterSetup, ForwardContext
+from transformers import BertModel, BertConfig, BertForSequenceClassification, ForwardContext
 
 """
     Code based on:
@@ -54,6 +50,23 @@ from transformers import BertModel, BertConfig, BertTokenizerFast, AutoAdapterMo
     input to the forward pass.
 """
 
+class Scaler(nn.Module):
+    def __init__(self, rate=1.0):
+        super().__init__()
+        self.rate = rate
+
+    def forward(self, input, ratio=None):
+        # if ratio is None:
+        #     ratio = self.rate
+        # if isinstance(ratio, float):
+        #     output = input / ratio #if self.training else input
+        # else:
+        #     plane = input.size(1)
+        #     ratio = ratio[:plane].to(input.device)
+        #     output = input / ratio.view(1, plane, 1, 1)
+        output = input
+        return output
+
 class SuperBertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -68,24 +81,37 @@ class SuperBertPooler(nn.Module):
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
+    def get_subnet(self, width_prune_ratio):
+        subnet = copy.deepcopy(self)
+        prune_in_width = int(self.dense.default_in_features * width_prune_ratio)
+        # Output width is always hidden_size (768)
+        subnet.dense = DynamicLinear(prune_in_width, self.dense.default_out_features)
+        subnet.dense.copy_linear(self.dense)
+        return subnet
+
 
 class SuperBertOutput(BertOutput):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
 
-        self.dense =  DynamicLinear(config.intermediate_size, config.hidden_size)
+        self.dense = DynamicLinear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = DynamicLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self._init_adapter_modules()
         self.active_width_ratio = 1.0
+        self.scaler = Scaler(self.active_width_ratio)
 
     def forward(self, hidden_states: torch.Tensor,
                 input_tensor: torch.Tensor,
                 width_prune_ratio=None) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        if width_prune_ratio is None:
+            width_prune_ratio = self.active_width_ratio
+        prune_width = int(width_prune_ratio * self.config.hidden_size)
+        hidden_states = self.dense(hidden_states, prune_width)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.adapter_layer_forward(hidden_states, input_tensor, self.LayerNorm)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor, prune_width)
+        hidden_states = self.scaler(hidden_states, width_prune_ratio)
         return hidden_states
 
     def get_subnet(self, width_prune_ratio: float = None):
@@ -97,12 +123,16 @@ class SuperBertOutput(BertOutput):
         if width_prune_ratio is None:
             width_prune_ratio = self.active_width_ratio
         prune_in_width = int(width_prune_ratio * self.config.intermediate_size)
+        prune_out_width = int(width_prune_ratio * self.config.hidden_size)
         subnet = copy.deepcopy(self)
         subnet.active_width_ratio = width_prune_ratio
-        subnet.dense = DynamicLinear(prune_in_width, self.config.hidden_size)
+        subnet.dense = DynamicLinear(prune_in_width, prune_out_width)
         subnet.dense.copy_linear(self.dense)
-
+        subnet.LayerNorm = DynamicLayerNorm(prune_out_width, eps=self.config.layer_norm_eps)
+        subnet.LayerNorm.copy_ln(self.LayerNorm)
+        subnet.scaler = Scaler(width_prune_ratio)
         return subnet
+
 
 class SuperBertSelfOutput(BertSelfOutput):
     def __init__(self, config):
@@ -114,13 +144,18 @@ class SuperBertSelfOutput(BertSelfOutput):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self._init_adapter_modules()
         self.active_width_ratio = 1.0
+        self.scaler = Scaler(self.active_width_ratio)
 
     def forward(self, hidden_states: torch.Tensor,
                 input_tensor: torch.Tensor,
                 width_prune_ratio=None) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        if width_prune_ratio is None:
+            width_prune_ratio = self.active_width_ratio
+        prune_width = int(width_prune_ratio * self.config.hidden_size)
+        hidden_states = self.dense(hidden_states, prune_width)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.adapter_layer_forward(hidden_states, input_tensor, self.LayerNorm)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor, prune_width)
+        hidden_states = self.scaler(hidden_states, width_prune_ratio)
         return hidden_states
 
     def get_subnet(self, width_prune_ratio: float = None):
@@ -134,9 +169,13 @@ class SuperBertSelfOutput(BertSelfOutput):
         prune_width = int(width_prune_ratio * self.config.hidden_size)
         subnet = copy.deepcopy(self)
         subnet.active_width_ratio = width_prune_ratio
-        subnet.dense = DynamicLinear(prune_width, self.config.hidden_size)
+        subnet.dense = DynamicLinear(prune_width, prune_width)
         subnet.dense.copy_linear(self.dense)
+        subnet.LayerNorm = DynamicLayerNorm(prune_width, eps=self.config.layer_norm_eps)
+        subnet.LayerNorm.copy_ln(self.LayerNorm)
+        subnet.scaler = Scaler(width_prune_ratio)
         return subnet
+
 
 class SuperBertSelfAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None, location_key: Optional[str] = None):
@@ -170,33 +209,33 @@ class SuperBertSelfAttention(nn.Module):
         self.prefix_tuning = PrefixTuningShim(location_key, config)
 
         self.active_width_ratio = 1.0
+        self.scaler = Scaler(self.active_width_ratio)
 
-    def transpose_for_scores(self, x: torch.Tensor, attention_head_size=None) -> torch.Tensor:
-        if attention_head_size is None:
-            attention_head_size = self.attention_head_size
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, attention_head_size)
+    def transpose_for_scores(self, x: torch.Tensor, attention_head_size, num_attention_heads) -> torch.Tensor:
+        new_x_shape = x.size()[:-1] + (num_attention_heads, attention_head_size)
         x = x.view(new_x_shape)
         return x.permute(0, 2, 1, 3)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        output_attentions: Optional[bool] = False,
-        width_prune_ratio=None,
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+            output_attentions: Optional[bool] = False,
+            width_prune_ratio=None,
     ) -> Tuple[torch.Tensor]:
 
         if width_prune_ratio is None:
             width_prune_ratio = self.active_width_ratio
 
+        num_attention_heads = int(width_prune_ratio * self.num_attention_heads)
         prune_hidden_size = int(width_prune_ratio * self.config.hidden_size)
-        attention_head_size = prune_hidden_size // self.num_attention_heads
-        all_head_size = self.num_attention_heads * attention_head_size
-        mixed_query_layer = self.query(hidden_states, prune_hidden_size)
+        attention_head_size = prune_hidden_size // num_attention_heads
+        all_head_size = num_attention_heads * attention_head_size
+        mixed_query_layer = self.scaler(self.query(hidden_states, prune_hidden_size), width_prune_ratio)
 
         # If this is instantiated as a cross-attention module, the keys
         # and values come from an encoder; the attention mask needs to be
@@ -209,19 +248,29 @@ class SuperBertSelfAttention(nn.Module):
             value_layer = past_key_value[1]
             attention_mask = encoder_attention_mask
         elif is_cross_attention:
-            key_layer = self.transpose_for_scores(self.key(encoder_hidden_states, prune_hidden_size), attention_head_size)
-            value_layer = self.transpose_for_scores(self.value(encoder_hidden_states, prune_hidden_size), attention_head_size)
+            key_layer = self.transpose_for_scores(self.scaler(self.key(encoder_hidden_states, prune_hidden_size), width_prune_ratio),
+                                                  attention_head_size, num_attention_heads)
+            value_layer = self.transpose_for_scores(self.scaler(self.value(encoder_hidden_states, prune_hidden_size), width_prune_ratio),
+                                                    attention_head_size, num_attention_heads)
             attention_mask = encoder_attention_mask
         elif past_key_value is not None:
-            key_layer = self.transpose_for_scores(self.key(hidden_states, prune_hidden_size), attention_head_size)
-            value_layer = self.transpose_for_scores(self.value(hidden_states, prune_hidden_size), attention_head_size)
+            key_layer = self.transpose_for_scores(
+                self.scaler(self.key(hidden_states, prune_hidden_size), width_prune_ratio),
+                attention_head_size, num_attention_heads)
+            value_layer = self.transpose_for_scores(
+                self.scaler(self.value(hidden_states, prune_hidden_size), width_prune_ratio),
+                attention_head_size, num_attention_heads)
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
         else:
-            key_layer = self.transpose_for_scores(self.key(hidden_states, prune_hidden_size), attention_head_size)
-            value_layer = self.transpose_for_scores(self.value(hidden_states, prune_hidden_size), attention_head_size)
+            key_layer = self.transpose_for_scores(
+                self.scaler(self.key(hidden_states, prune_hidden_size), width_prune_ratio),
+                attention_head_size, num_attention_heads)
+            value_layer = self.transpose_for_scores(
+                self.scaler(self.value(hidden_states, prune_hidden_size), width_prune_ratio),
+                attention_head_size, num_attention_heads)
 
-        query_layer = self.transpose_for_scores(mixed_query_layer, attention_head_size)
+        query_layer = self.transpose_for_scores(mixed_query_layer, attention_head_size, num_attention_heads)
 
         use_cache = past_key_value is not None
         if self.is_decoder:
@@ -294,23 +343,25 @@ class SuperBertSelfAttention(nn.Module):
 
     def get_subnet(self, width_prune_ratio: float = None):
         """
-        提取当前层的子网，根据给定的宽度比例。
-        :param width_prune_ratio: 子网的宽度比例。
-        :return: 一个子网实例。
+            提取当前层的子网，根据给定的宽度比例。
+            :param width_prune_ratio: 子网的宽度比例。
+            :return: 一个子网实例。
         """
         if width_prune_ratio is None:
             width_prune_ratio = self.active_width_ratio
         subnet = copy.deepcopy(self)
         subnet.active_width_ratio = width_prune_ratio
-        prune_out_width = int(self.config.hidden_size * width_prune_ratio)
-        subnet.query = DynamicLinear(self.config.hidden_size, prune_out_width)
+        prune_width = int(self.config.hidden_size * width_prune_ratio)
+        subnet.query = DynamicLinear(prune_width, prune_width)
         subnet.query.copy_linear(self.query)
 
-        subnet.key = DynamicLinear(self.config.hidden_size, prune_out_width)
+        subnet.key = DynamicLinear(prune_width, prune_width)
         subnet.key.copy_linear(self.key)
 
-        subnet.value = DynamicLinear(self.config.hidden_size, prune_out_width)
+        subnet.value = DynamicLinear(prune_width, prune_width)
         subnet.value.copy_linear(self.value)
+
+        subnet.scaler = Scaler(rate=width_prune_ratio)
         return subnet
 
 class SuperBertAttention(nn.Module):
@@ -318,21 +369,22 @@ class SuperBertAttention(nn.Module):
         super().__init__()
         self.config = config
         # 确保location_key被正确传递给SuperBertSelfAttention
-        self.self = SuperBertSelfAttention(config, position_embedding_type=position_embedding_type, location_key="encoder")
+        self.self = SuperBertSelfAttention(config, position_embedding_type=position_embedding_type,
+                                           location_key="encoder")
         self.output = SuperBertSelfOutput(config)  # 动态宽度推理的输出层
         self.pruned_heads = set()
         self.active_width_ratio = 1.0  # 当前激活的宽度比例
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        output_attentions: Optional[bool] = False,
-        width_prune_ratio: Optional[float] = None,
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+            output_attentions: Optional[bool] = False,
+            width_prune_ratio: Optional[float] = None,
     ) -> Tuple[torch.Tensor]:
         """
         动态宽度推理的前向传播。
@@ -387,6 +439,7 @@ class SuperBertIntermediate(nn.Module):
         else:
             self.intermediate_act_fn = config.hidden_act
         self.active_width_ratio = 1.0
+        self.scaler = Scaler(rate=self.active_width_ratio)
 
     def forward(self, hidden_states: torch.Tensor,
                 width_prune_ratio=None) -> torch.Tensor:
@@ -395,6 +448,7 @@ class SuperBertIntermediate(nn.Module):
         width = int(self.config.intermediate_size * width_prune_ratio)
         hidden_states = self.dense(hidden_states, width)
         hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.scaler(hidden_states, width_prune_ratio)
         return hidden_states
 
     def get_subnet(self, width_prune_ratio: float = None):
@@ -405,11 +459,13 @@ class SuperBertIntermediate(nn.Module):
         """
         if width_prune_ratio is None:
             width_prune_ratio = self.active_width_ratio
+        prune_in_width = int(self.config.hidden_size * width_prune_ratio)
         prune_out_width = int(self.config.intermediate_size * width_prune_ratio)
         subnet = copy.deepcopy(self)
         subnet.active_width_ratio = width_prune_ratio
-        subnet.dense = DynamicLinear(self.config.hidden_size, prune_out_width)
+        subnet.dense = DynamicLinear(prune_in_width, prune_out_width)
         subnet.dense.copy_linear(self.dense)
+        subnet.scaler = Scaler(rate=width_prune_ratio)
         return subnet
 
 
@@ -423,15 +479,15 @@ class SuperBertLayer(nn.Module):
         self.active_width_ratio = 1.0  # 当前激活的宽度比例
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        output_attentions: Optional[bool] = False,
-        width_prune_ratio: Optional[float] = None,
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+            output_attentions: Optional[bool] = False,
+            width_prune_ratio: Optional[float] = None,
     ) -> Tuple[torch.Tensor]:
         """
         动态宽度推理的前向传播。
@@ -439,6 +495,7 @@ class SuperBertLayer(nn.Module):
         """
         if width_prune_ratio is None:
             width_prune_ratio = self.active_width_ratio
+        hidden_states = hidden_states[:, :, :int(self.config.hidden_size * width_prune_ratio)]
 
         # 动态调整注意力层的宽度
         attention_outputs = self.attention(
@@ -480,26 +537,27 @@ class SuperBertLayer(nn.Module):
         subnet.output = subnet.output.get_subnet(width_prune_ratio)
         return subnet
 
-class SuperBertEncoder(nn.Module):
+
+class SuperBertEncoder(BertEncoder):
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.layer = nn.ModuleList([SuperBertLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = False,
-        output_hidden_states: Optional[bool] = False,
-        return_dict: Optional[bool] = True,
-        active_output_path=None,
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = False,
+            output_hidden_states: Optional[bool] = False,
+            return_dict: Optional[bool] = True,
+            active_output_path=None,
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPastAndCrossAttentions]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -530,7 +588,7 @@ class SuperBertEncoder(nn.Module):
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
-                        return module(*inputs, past_key_value, output_attentions)
+                        return module(*inputs, past_key_value, output_attentions, active_width_prune_ratio)
 
                     return custom_forward
 
@@ -540,8 +598,7 @@ class SuperBertEncoder(nn.Module):
                     attention_mask,
                     layer_head_mask,
                     encoder_hidden_states,
-                    encoder_attention_mask,
-                    active_width_prune_ratio
+                    encoder_attention_mask
                 )
             else:
                 layer_outputs = layer_module(
@@ -596,6 +653,7 @@ class SuperBertEncoder(nn.Module):
         subnet.layer = nn.ModuleList([layer.get_subnet(active_width) for layer in subnet.layer])
         return subnet
 
+
 class SuperBertModel(BertModel):
 
     def __init__(self, config):
@@ -613,16 +671,19 @@ class SuperBertModel(BertModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-
     def load_pretrained_weights(self, pretrained_model_name="bert-base-uncased"):
         pretrained_model = BertModel.from_pretrained(pretrained_model_name)
         self.embeddings.load_state_dict(pretrained_model.embeddings.state_dict())
         for i, layer in enumerate(self.encoder.layer):
-            layer.attention.self.query.load_state_dict(pretrained_model.encoder.layer[i].attention.self.query.state_dict())
+            layer.attention.self.query.load_state_dict(
+                pretrained_model.encoder.layer[i].attention.self.query.state_dict())
             layer.attention.self.key.load_state_dict(pretrained_model.encoder.layer[i].attention.self.key.state_dict())
-            layer.attention.self.value.load_state_dict(pretrained_model.encoder.layer[i].attention.self.value.state_dict())
-            layer.attention.output.dense.load_state_dict(pretrained_model.encoder.layer[i].attention.output.dense.state_dict())
-            layer.attention.output.LayerNorm.load_state_dict(pretrained_model.encoder.layer[i].attention.output.LayerNorm.state_dict())
+            layer.attention.self.value.load_state_dict(
+                pretrained_model.encoder.layer[i].attention.self.value.state_dict())
+            layer.attention.output.dense.load_state_dict(
+                pretrained_model.encoder.layer[i].attention.output.dense.state_dict())
+            layer.attention.output.LayerNorm.load_state_dict(
+                pretrained_model.encoder.layer[i].attention.output.LayerNorm.state_dict())
             layer.intermediate.dense.load_state_dict(pretrained_model.encoder.layer[i].intermediate.dense.state_dict())
             layer.output.dense.load_state_dict(pretrained_model.encoder.layer[i].output.dense.state_dict())
             layer.output.LayerNorm.load_state_dict(pretrained_model.encoder.layer[i].output.LayerNorm.state_dict())
@@ -743,6 +804,10 @@ class SuperBertModel(BertModel):
         if active_output_path is None:
             active_output_path = self.config.active_output_path
 
+        active_layers, active_width_ratio = active_output_path
+        active_hidden_size = int(self.config.hidden_size * active_width_ratio)
+        embedding_output = embedding_output[:, :, :active_hidden_size]  # [batch_size, seq_length, active_hidden_size]
+
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
@@ -778,23 +843,23 @@ class SuperBertModel(BertModel):
         subnet = copy.deepcopy(self)
         subnet.config.active_output_path = subnet_config
         subnet.encoder = subnet.encoder.get_subnet(subnet_config)
+        if subnet.pooler is not None:
+            subnet.pooler = subnet.pooler.get_subnet(subnet_config[1])
 
         return subnet
 
 
-class SuperBertAdapterModel(BertAdapterModel):
-
-
+class SuperBertForSequenceClassification(BertForSequenceClassification):
     def __init__(self, config: BertConfig):
         super().__init__(config)
-        del self.bert
         self.config.default_output_path = (self.config.num_hidden_layers, 1.0)
         self.config.active_output_path = self.config.default_output_path
-        self.bert = SuperBertModel(config)
-
-        self._init_head_modules()
-
-        self.init_weights()
+        self.bert = SuperBertModel(self.config)
+        classifier_dropout = (
+            self.config.classifier_dropout if self.config.classifier_dropout is not None else self.config.hidden_dropout_prob
+        )
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.classifier = nn.Linear(self.config.hidden_size, self.config.num_labels)
 
         self.NUM_SUBLAYER = 1
         self.BASE_DEPTH_LIST = [self.config.num_hidden_layers]
@@ -804,35 +869,37 @@ class SuperBertAdapterModel(BertAdapterModel):
             torch.tensor(self.BASE_DEPTH_LIST) * torch.tensor(self.STAGE_WIDTH_LIST))
         self.layer_cost = torch.repeat_interleave(vec, torch.tensor(self.BASE_DEPTH_LIST))
 
-    def get_progressive_subnet_configs(self):
+
+    def get_progressive_subnet_configs(self, A=5, stage=0):
 
         subnetwork_configs = []
 
-        active_layers, active_width = self.config.active_output_path
-        width_pruning_ratio_list = self.config.width_pruning_ratio_list
-        sublayer_ratio_list = width_pruning_ratio_list[width_pruning_ratio_list.index(active_width):]
+        IndependentRandomSampling = 0
+        RecursiveRandomSampling = 1
+        WeightedRandomSampling = 2
 
-        DepthProgressive = 0
-        WidthProgressive = 1
-        TwoDProgressive = 2
-        RandProgressive = 3
-
-        choices = [DepthProgressive, WidthProgressive, RandProgressive]
-
-        chosen = random.choices(choices, k=1)[0]
-        if chosen == DepthProgressive:
-            subnetwork_configs = [(i+1, active_width) for i in range(active_layers)]
-
-        elif chosen == WidthProgressive:
-            subnetwork_configs = [(active_layers, width_ratio) for width_ratio in sublayer_ratio_list]
-
-        else:
-            for _ in range(5):
+        '''Independent Random sample'''
+        if stage == IndependentRandomSampling:
+            for _ in range(A):
                 subnetwork_config = self.random_sample_subnet_config()
                 if subnetwork_config not in subnetwork_configs:
                     subnetwork_configs.append(subnetwork_config)
-        random.shuffle(subnetwork_configs)
-        subnetwork_configs = subnetwork_configs[:3]
+            subnetwork_configs = subnetwork_configs[:A]
+        elif stage == RecursiveRandomSampling:
+            '''Recursive Random sample'''
+            last_subnet_config = self.active_output_path
+            while True:
+                subnetwork_config = self.random_sample_subnet_config(last_subnet_config)
+                if last_subnet_config == self.smallest_output_path or last_subnet_config==subnetwork_config:
+                    break
+                subnetwork_configs.append(subnetwork_config)
+                last_subnet_config = subnetwork_config
+        elif stage == WeightedRandomSampling:
+            '''Dynamic Weighted Sample'''
+            if self.dynamic_subnet_sampler is None:
+                self.all_subnet_configs = self.generate_all_subnet_configs()[1:]
+                self.dynamic_subnet_sampler = DynamicWeightedSampler(len(self.all_subnet_configs), decay_factor=0.9)
+            subnetwork_configs = [self.all_subnet_configs[idx] for idx in self.dynamic_subnet_sampler.sample(A)]
 
         return subnetwork_configs
 
@@ -840,7 +907,7 @@ class SuperBertAdapterModel(BertAdapterModel):
         subnet_configs = []
         for i in range(self.config.num_hidden_layers):
             for k in self.config.width_pruning_ratio_list:
-                subnet_configs.append((i+1, k))
+                subnet_configs.append((i + 1, k))
         return subnet_configs
 
     def random_sample_subnet_config(self, max_net_config=None):
@@ -868,36 +935,37 @@ class SuperBertAdapterModel(BertAdapterModel):
         return subnet
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
+        output_type=SequenceClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+        expected_output=_SEQ_CLASS_EXPECTED_OUTPUT,
+        expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
+    )
     def forward(
             self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-            head=None,
-            output_adapter_gating_scores=False,
-            output_adapter_fusion_attentions=False,
-            active_output_path=None,
-            **kwargs
-    ):
-        input_ids = input_ids.view(-1, input_ids.size(-1)) if input_ids is not None else None
-        attention_mask = attention_mask.view(-1, attention_mask.size(-1)) if attention_mask is not None else None
-        token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1)) if token_type_ids is not None else None
-        position_ids = position_ids.view(-1, position_ids.size(-1)) if position_ids is not None else None
-        inputs_embeds = (
-            inputs_embeds.view(-1, inputs_embeds.size(-2), inputs_embeds.size(-1))
-            if inputs_embeds is not None
-            else None
-        )
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            token_type_ids: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            active_output_path=None
+    ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
         if active_output_path is None:
             active_output_path = self.config.active_output_path
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.bert(
             input_ids,
@@ -909,64 +977,83 @@ class SuperBertAdapterModel(BertAdapterModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            output_adapter_gating_scores=output_adapter_gating_scores,
-            output_adapter_fusion_attentions=output_adapter_fusion_attentions,
-            adapter_input_parallelized=kwargs.pop("adapter_input_parallelized", False),
-            active_output_path=active_output_path,
+            active_output_path=active_output_path
         )
-        # BERT & RoBERTa return the pooled output as second item, we don't need that in these heads
-        if not return_dict:
-            head_inputs = (outputs[0],) + outputs[2:]
-        else:
-            head_inputs = outputs
+
         pooled_output = outputs[1]
 
-        if head or AdapterSetup.get_context_head_setup() or self.active_head:
-            head_outputs = self.forward_head(
-                head_inputs,
-                head_name=head,
-                attention_mask=attention_mask,
-                return_dict=return_dict,
-                pooled_output=pooled_output,
-                **kwargs,
-            )
-            return head_outputs
-        else:
-            # in case no head is used just return the output of the base model (including pooler output)
-            return outputs
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
 
-def super_bert_base(width_pruning_ratio_list: list, num_classes: int = 3) -> SuperBertAdapterModel:
+        loss = None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+def super_bert_base(width_pruning_ratio_list: list, num_classes: int = 3) -> BertForSequenceClassification:
     configuration = BertConfig()
     configuration.width_pruning_ratio_list = width_pruning_ratio_list
-    configuration.num_classes = num_classes
-    model = SuperBertAdapterModel(configuration)
+    configuration.num_labels = num_classes
+    model = SuperBertForSequenceClassification(configuration)
+    # model = model.from_pretrained("bert-base-uncased", num_labels=num_classes)
     model.load_pretrained_weights("bert-base-uncased")
-    model.add_adapter("mnli")
-    model.add_classification_head("mnli", num_labels=num_classes)
-    model.active_adapters = "mnli"
-    model.train_adapter("mnli")
+    model.gradient_checkpointing_enable()
     return model
+
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from hypernet.utils.evaluation import visualize_model_parameters, count_parameters
+from hypernet.utils.evaluation import count_parameters
 from hypernet.datasets.load_mnli import get_datasets, collate_fn, load_mnli
-def eval_all_subnets(model: SuperBertAdapterModel, data_path, device="cpu"):
 
-    _, test_set = get_datasets(data_path)
 
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False, collate_fn=collate_fn, num_workers=4)
+def eval_all_subnets(model: BertForSequenceClassification, data_path, device="cpu"):
+    train_set, test_set = get_datasets(data_path)
+
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=128, shuffle=False, collate_fn=collate_fn,
+                                              num_workers=4)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False, collate_fn=collate_fn,
+                                              num_workers=4)
 
     def fine_tuning(m):
         m.train()
         with torch.no_grad():
-            for data in test_loader:
+            for data in train_loader:
                 inputs, labels = data
                 labels = labels.to(device)
                 outputs = m(inputs[0].to(device),
                             token_type_ids=inputs[1].to(device),
                             attention_mask=inputs[2].to(device),
-                            output_hidden_states=True,)
+                            output_hidden_states=True, )
 
     all_subnet_configs = model.generate_all_subnet_configs()
     all_subnet_configs.reverse()
@@ -977,6 +1064,7 @@ def eval_all_subnets(model: SuperBertAdapterModel, data_path, device="cpu"):
         # fine_tuning(subnet)
         model_size, accuracy = test(subnet, test_loader, device=device)
         results.append((model_size, accuracy))
+        print(model_size, accuracy)
 
     sizes, accuracies = zip(*results)
     pd.DataFrame({
@@ -991,7 +1079,8 @@ def eval_all_subnets(model: SuperBertAdapterModel, data_path, device="cpu"):
     plt.title('Model Size vs Accuracy')
     plt.show()
 
-def test(model, test_loader, active_path=None, device="cpu"):
+
+def test(model, data_loader, active_path=None, device="cpu"):
     # 测试集测试准确率，召回率，F1，以及top-1,top-2,top-3
     correct = 0
     total = 0
@@ -1000,7 +1089,7 @@ def test(model, test_loader, active_path=None, device="cpu"):
     top_3 = 0
     model.eval()
     with torch.no_grad():
-        for data in test_loader:
+        for data in data_loader:
             inputs, labels = data
             outputs = model(inputs[0].to(device),
                             token_type_ids=inputs[1].to(device),
@@ -1028,71 +1117,154 @@ def test(model, test_loader, active_path=None, device="cpu"):
     print(f"Top-3 Accuracy: {100 * top_3 / total}%")
     return model_size, accuracy
 
+
+def log_weights_gradients_distribution(
+        model: torch.nn.Module,
+        writer: SummaryWriter,
+        step: int,
+        tag_prefix: str = "model",
+        layer_types: Optional[List[str]] = None,
+        log_weights: bool = True,
+        log_gradients: bool = True
+):
+    """
+    记录模型各层权重和梯度的分布直方图到TensorBoard
+
+    参数:
+        model (nn.Module): 要监控的PyTorch模型
+        writer (SummaryWriter): TensorBoard写入器
+        step (int): 当前训练步数(用于x轴)
+        tag_prefix (str): 标签前缀(用于TensorBoard分类)
+        layer_types (List[str]): 要记录的层类型(如['conv', 'fc'])，None表示全部
+        log_weights (bool): 是否记录权重分布
+        log_gradients (bool): 是否记录梯度分布
+    """
+    for name, param in model.named_parameters():
+        # 过滤层类型
+        if layer_types and not any([t in name for t in layer_types]):
+            continue
+
+        # 记录权重分布
+        if log_weights and param.requires_grad:
+            writer.add_histogram(
+                tag=f"{tag_prefix}/weights/{name}",
+                values=param.data,
+                global_step=step
+            )
+
+        # 记录梯度分布
+        if log_gradients and param.grad is not None:
+            writer.add_histogram(
+                tag=f"{tag_prefix}/gradients/{name}",
+                values=param.grad.data,
+                global_step=step
+            )
+
+
+from tqdm import tqdm
+from hypernet.utils.metric_utils import KLLoss
 def train(model, train_loader, test_loader, active_config=None, sub_config=None, epochs=10, device="cpu"):
-    optimizer = torch.optim.SGD(model.parameters(), lr=3e-5, momentum=0.9, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
+    # 使用AdamW优化器更适合Transformer模型
+    optimizer = torch.optim.SGD(model.parameters(), lr=5e-3, momentum=0.9, weight_decay=1e-4)
+    # 添加学习率调度器
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs*len(train_loader))
+    criterion = nn.CrossEntropyLoss().cuda()
+    mse_loss = nn.MSELoss().cuda()
+    warm_up_epochs = 0
+    temp = 5.
+    kd_ratio = 0
+    kd_loss = KLLoss(temp).cuda()
     # 迭代训练resnet到50个epoch，每10个epoch测试一次
+    acc = 0.
     for epoch in range(epochs):
         model.train()
-        # model.re_organize_weights()
+        # 打印模型设置和模型参数
+        epoch_progress = tqdm(total=len(train_loader), desc=f'Epoch {epoch+1}/{epochs}', unit='batch')
+ 
         for i, (inputs, labels) in enumerate(train_loader):
-            subnet_configs = model.get_progressive_subnet_configs()
+            subnet_configs = model.get_progressive_subnet_configs(3)
+            # subnet_configs = model.random_sample_subnet_config()
             optimizer.zero_grad()
             outputs = model(inputs[0].to(device),
                             token_type_ids=inputs[1].to(device),
                             attention_mask=inputs[2].to(device),
                             output_hidden_states=True)
             loss = criterion(outputs.logits, labels.to(device, dtype=torch.long))
-            n = 1
-            for sub_config in subnet_configs:
-                sub_outputs = model(inputs[0].to(device),
-                                    token_type_ids=inputs[1].to(device),
-                                    attention_mask=inputs[2].to(device),
-                                    output_hidden_states=True,
-                                    active_output_path=sub_config)
-                sub_loss = criterion(sub_outputs.logits, labels.to(device, dtype=torch.long))
-                loss += sub_loss
-                n += 1
             loss.backward()
+
+            soft_logits = outputs.logits.detach()
+            # soft_label = torch.softmax(soft_logits, dim=1)
+
+            losses_subnets = []
+            if epoch >= warm_up_epochs:
+                for sub_config in subnet_configs:
+                    sub_outputs = model(inputs[0].to(device),
+                                        token_type_ids=inputs[1].to(device),
+                                        attention_mask=inputs[2].to(device),
+                                        output_hidden_states=True,
+                                        active_output_path=sub_config)
+
+                    sub_loss = (kd_ratio * kd_loss(sub_outputs.logits, soft_logits) +
+                                criterion(sub_outputs.logits, labels.to(device, dtype=torch.long)))
+                    loss += sub_loss
+                    # sub_loss = kd_ratio * mse_loss(sub_outputs.logits, soft_logits) +
+                    #            criterion(sub_outputs.logits, labels.to(device, dtype=torch.long))
+
+                    losses_subnets.append(sub_loss.item())
+                    sub_loss.backward()
+
+            # loss.backward()
+            # 添加梯度裁剪防止梯度爆炸
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            if i % 500 == 0:
-                print(f"Epoch {epoch} Iter {i} Loss {loss.item()}")
-        if epoch % 5 == 0:
-            test(model, test_loader, device=device)
 
-def train_test(model: SuperBertAdapterModel, epochs=10, device="cpu"):
-    data_shares = [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.05, 0.05, 0.05, 0.05, 0.1, 0.1, 0.5]
-    trainData, testData = load_mnli(os.path.join("../../../data", "mnli", 'original'),
-                                    data_shares, 0.5, 1)
+            if i % 500 == 0:  # 每5个batch记录一次
+                _, acc = test(model, test_loader, device=device)
+            sub_losses = sum(losses_subnets)/len(losses_subnets)
+            epoch_progress.set_postfix(
+                {
+                    'loss': f"{loss.item():.4f}",
+                    'acc': f"{acc:.2f}%",
+                    'losses': losses_subnets,
+                    "configs": subnet_configs,
+                }
+            )
+            epoch_progress.update(1)
+            torch.cuda.empty_cache()
+        epoch_progress.close()
 
-    train_loader = torch.utils.data.DataLoader(trainData[-1],
-                                               batch_size=128,
+
+def train_test(model: BertForSequenceClassification, data_path, epochs=10, device="cpu"):
+    trainData, testData = get_datasets(data_path)
+
+    train_loader = torch.utils.data.DataLoader(trainData,
+                                               batch_size=64,
                                                shuffle=True,
                                                collate_fn=collate_fn,
                                                num_workers=4)
-    test_loader = torch.utils.data.DataLoader(testData[-1],
-                                               batch_size=128,
-                                               shuffle=False,
-                                               collate_fn=collate_fn,
-                                               num_workers=4)
+    test_loader = torch.utils.data.DataLoader(testData,
+                                              batch_size=64,
+                                              shuffle=False,
+                                              collate_fn=collate_fn,
+                                              num_workers=4)
 
     train(model, train_loader, test_loader, epochs=epochs, device=device)
     test(model, test_loader, device=device)
-    for i in range(10):
+    for i in range(100):
         subnet_config = model.random_sample_subnet_config()
         test(model, test_loader, subnet_config, device=device)
 
         subnet = model.get_subnet(subnet_config)
         test(subnet, test_loader, device=device)
+        
 
 
 if __name__ == '__main__':
     # Initializing a model from the bert-base-uncased style configuration
+    
     device = "cuda"
     bert = super_bert_base([1.0, 0.75, 0.5, 0.25], 3).to(device)
-    train_test(bert, epochs=50, device=device)
+    small_bert = bert.get_subnet((4, 0.25)).to(device)
+    train_test(small_bert, data_path=os.path.join("../../../../Datasets/MNLI/multinli_1.0", 'original'), epochs=50, device=device)
     # bert = torch.load("../../logs/mnli/seed4321/hypernet.pth").to(device)
     # eval_all_subnets(bert, os.path.join("../../../data", "mnli", 'original'), device=device)
-
-
-

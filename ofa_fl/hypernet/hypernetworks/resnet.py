@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 
 from hypernet.datasets.load_cifar import load_cifar, get_datasets
-from hypernet.utils.common_utils import make_divisible, adjust_bn_according_to_idx, get_net_device
+from hypernet.utils.common_utils import make_divisible, adjust_bn_according_to_idx, get_net_device, DynamicWeightedSampler
 from hypernet.base.dynamic_modules import DynamicBatchNorm2d, DynamicConv2d, Scaler, MyIdentity, DynamicGroupNorm, \
     DynamicLinear
 from itertools import product
@@ -226,6 +226,7 @@ class DynamicBasicBlock(nn.Module):
             self.active_out_channels,
             mid_planes=out_channels,
             stride=self.stride,
+            norm_way=self.norm_way,
             scale_ratio=out_channels / self.default_out_channels,
             use_scaler=self.use_scaler,
             track_running_stats=self.track_running_stats
@@ -535,10 +536,13 @@ class SuperResnet(nn.Module):
         )
 
         # client_idx: subnet_config
-        self.subnet_configs = []
+        self.subnet_width_progress_configs = None
+        self.subnet_depth_progress_configs = None
+        self.dynamic_subnet_sampler = None
 
         self.default_output_path = self.get_default_config()
         self.active_output_path = self.default_output_path
+        self.smallest_output_path = {"sublayer_0": {"block_0": width_pruning_ratio_list[-1]}}
 
         vec = torch.tensor(self.STAGE_WIDTH_LIST) / torch.sum(
             torch.tensor(self.BASE_DEPTH_LIST) * torch.tensor(self.STAGE_WIDTH_LIST))
@@ -553,11 +557,11 @@ class SuperResnet(nn.Module):
             sub_layer.append((f"block_{idx}", block(in_planes,
                                                     out_planes*block.expansion,
                                                     mid_planes=out_planes,
-                                                stride=stride,
-                                                norm_way=self.norm_way,
-                                                scale_ratio=max(self.width_pruning_ratio_list),
-                                                use_scaler=self.use_scaler,
-                                                track_running_stats=self.track_running_stats)))
+                                                    stride=stride,
+                                                    norm_way=self.norm_way,
+                                                    scale_ratio=max(self.width_pruning_ratio_list),
+                                                    use_scaler=self.use_scaler,
+                                                    track_running_stats=self.track_running_stats)))
             in_planes = out_planes * block.expansion
         return nn.Sequential(OrderedDict(sub_layer))
 
@@ -570,86 +574,41 @@ class SuperResnet(nn.Module):
 
         return default_config
 
-    def get_progressive_subnet_configs(self, reverse=False):
+    def get_progressive_subnet_configs(self, A=5, stage=0):
 
         subnetwork_configs = []
-        # subnetwork_configs.extend(self.subnet_configs)
-        num_sublayers = len(self.active_output_path)
-        sublayer_depth_list = [len(v) for v in self.active_output_path.values()]
-        max_depth = max(sublayer_depth_list)
-        sublayer_ratio_list = [v["block_0"] for v in self.active_output_path.values()]
-        max_ratio = max(sublayer_ratio_list)
 
-        DepthProgressive = 0
-        WidthProgressive = 1
-        TwoDProgressive = 2
-        RandProgressive = 3
+        IndependentRandomSampling = 0
+        RecursiveRandomSampling = 1
+        WeightedRandomSampling = 2
 
-        choices = [DepthProgressive, WidthProgressive, RandProgressive]
-
-        chosen = random.choices(choices, k=1)[0]
-        if chosen == DepthProgressive:
-            num_sublayer_list = sorted(range(num_sublayers, 0, -1), reverse=reverse)
-            for num_sub in num_sublayer_list:
-                subnetwork_config = {}
-                for i, (k, y) in enumerate(self.active_output_path.items()):
-                    if i != num_sub - 1:
-                        subnetwork_config[k] = self.active_output_path[k]
-                    else:
-                        num_depth_list = sorted(range(len(self.active_output_path[k]), 0, -1), reverse=reverse)
-                        for depth in num_depth_list:
-                            subnetwork_config[k] = {}
-                            for j, (kk, yy) in enumerate(self.active_output_path[k].items()):
-                                subnetwork_config[k][kk] = yy
-                                if j == depth - 1:
-                                    break
-                            if subnetwork_config != self.active_output_path:
-                                subnetwork_configs.append(subnetwork_config.copy())
-                    if i == num_sub - 1:
-                        break
-
-        elif chosen == WidthProgressive:
-            # Step 1: 为每个子层生成独立的可用宽度比例列表
-            sublayer_ratio_ranges = {}
-            for sublayer_name in self.active_output_path:
-                # 获取该子层在active_output_path中的最大比例
-                max_ratio_in_sublayer = max(self.active_output_path[sublayer_name].values())
-
-                # 截取允许的比例列表：从最小到该子层的最大比例
-                valid_ratios = [
-                    ratio for ratio in self.width_pruning_ratio_list
-                    if ratio <= max_ratio_in_sublayer
-                ]
-                sublayer_ratio_ranges[sublayer_name] = sorted(valid_ratios, reverse=False)  # 升序排列
-
-            # Step 2: 生成所有可能的组合（笛卡尔积）
-            all_ratio_combinations = product(
-                *[sublayer_ratio_ranges[f"sublayer_{i}"] for i in range(num_sublayers)]
-            )
-
-            # Step 3: 构建子网络配置
-            for ratio_combination in all_ratio_combinations:
-                subnetwork_config = {}
-                for sublayer_idx, ratio in enumerate(ratio_combination):
-                    sublayer_name = f"sublayer_{sublayer_idx}"
-                    subnetwork_config[sublayer_name] = {}
-                    # 保持每层块数不变，仅修改宽度比例
-                    for block_name in self.active_output_path[sublayer_name]:
-                        subnetwork_config[sublayer_name][block_name] = ratio
-                subnetwork_configs.append(subnetwork_config)
-
-        else:
-            for _ in range(5):
+        '''Independent Random sample'''
+        if stage == IndependentRandomSampling:
+            for _ in range(A):
                 subnetwork_config = self.random_sample_subnet_config()
                 if subnetwork_config not in subnetwork_configs:
                     subnetwork_configs.append(subnetwork_config)
-        random.shuffle(subnetwork_configs)
-        subnetwork_configs = subnetwork_configs[:3]
+            subnetwork_configs = subnetwork_configs[:A]
+        elif stage == RecursiveRandomSampling:
+            '''Recursive Random sample'''
+            last_subnet_config = self.active_output_path
+            while True:
+                subnetwork_config = self.random_sample_subnet_config(last_subnet_config)
+                if last_subnet_config == self.smallest_output_path or last_subnet_config==subnetwork_config:
+                    break
+                subnetwork_configs.append(subnetwork_config)
+                last_subnet_config = subnetwork_config
+        elif stage == WeightedRandomSampling:
+            '''Dynamic Weighted Sample'''
+            if self.dynamic_subnet_sampler is None:
+                self.all_subnet_configs = self.generate_all_subnet_configs()[1:]
+                self.dynamic_subnet_sampler = DynamicWeightedSampler(len(self.all_subnet_configs), decay_factor=0.9)
+            subnetwork_configs = [self.all_subnet_configs[idx] for idx in self.dynamic_subnet_sampler.sample(A)]
 
         return subnetwork_configs
 
     # 随机生成前向路径索引
-    def random_sample_subnet_config(self, max_net_config=None, budget=None):
+    def random_sample_subnet_config(self, max_net_config=None):
         if max_net_config is None:
             max_net_config = self.active_output_path
 
@@ -660,12 +619,10 @@ class SuperResnet(nn.Module):
             BASE_DEPTH_LIST.append(len(max_net_config[sublayer_name]))
         subnetwork_config = {}
 
-        # 随机生成每个隐藏层的子层数量（至少为1）
+        # # 随机生成每个隐藏层的子层数量（至少为1）
         num_sublayers = random.randint(1, NUM_SUBLAYER)
-
         for sublayer in range(num_sublayers):
             subnetwork_config[f'sublayer_{sublayer}'] = {}
-
             # 随机生成每个子层的块数量（至少为1）
             num_blocks = random.randint(1, BASE_DEPTH_LIST[sublayer])
             active_compression_rate = self.width_pruning_ratio_list[self.width_pruning_ratio_list.index(
@@ -675,10 +632,59 @@ class SuperResnet(nn.Module):
                 subnetwork_config[f'sublayer_{sublayer}'][f'block_{block}'] = compression_rate
         return subnetwork_config
 
+    # def generate_all_subnet_configs_old(self):
+    #     all_configs = []
+    #     for num_sublayer in range(self.NUM_SUBLAYER, 0, -1):
+    #         self.recursion_all_subnet_configs(num_sublayer, all_configs)
+    #     return all_configs
+
     def generate_all_subnet_configs(self):
         all_configs = []
+
+        # 获取当前 active_output_path 的结构信息
+        current_config = self.active_output_path
+
+        num_sublayers = len(current_config)
+
+        # 每一层最多允许的 block 数量
+        max_block_num = [
+            len(current_config[f"sublayer_{i}"])
+            for i in range(num_sublayers)
+        ]
+
+        # 每一层允许的最大 width ratio
+        max_width_ratio = [
+            max(current_config[f"sublayer_{i}"].values())
+            for i in range(num_sublayers)
+        ]
+
+        def recursion_all_subnet_configs(max_sublayer, all_configs, sublayer=0, current_config=None, budget=None):
+            if current_config is None:
+                current_config = {}
+
+            if sublayer == max_sublayer:
+                all_configs.append(copy.deepcopy(current_config))
+                return
+
+            # 只能使用 ≤ 当前层数的 block 数量
+            valid_num_blocks = range(self.BASE_DEPTH_LIST[sublayer], 0, -1)
+            valid_num_blocks = [n for n in valid_num_blocks if n <= max_block_num[sublayer]]
+
+            # 只能使用 ≤ 当前最大压缩率
+            valid_ratios = [r for r in self.width_pruning_ratio_list if r <= max_width_ratio[sublayer]]
+
+            for num_blocks in valid_num_blocks:
+                for compression_rate in valid_ratios:
+                    current_config[f'sublayer_{sublayer}'] = {f'block_{block}': compression_rate for block in
+                                                              range(num_blocks)}
+                    recursion_all_subnet_configs(max_sublayer, all_configs, sublayer + 1, current_config)
+
+        # 先从最大层数开始向下搜索
         for num_sublayer in range(self.NUM_SUBLAYER, 0, -1):
-            self.recursion_all_subnet_configs(num_sublayer, all_configs)
+            if num_sublayer > len(current_config):
+                continue  # 如果当前模型层数不够，则跳过更深层的枚举
+            recursion_all_subnet_configs(num_sublayer, all_configs)
+
         return all_configs
 
     def recursion_all_subnet_configs(self, max_sublayer, all_configs, sublayer=0, current_config=None, budget=None):
@@ -773,13 +779,13 @@ class SuperResnet(nn.Module):
         subnet.hidden_layer = nn.Sequential(OrderedDict(sub_hidden_layer))
         return subnet
 
-def super_resnet18(trs, use_scaler, width_ratio_list: list, num_classes):
+def super_resnet18(trs, use_scaler, width_ratio_list: list, num_classes, input_size=(1, 3, 32, 32)):
     return SuperResnet(
         block=DynamicBasicBlock,
         num_sublayer=4,
         depth_list=[2, 2, 2, 2],
         width_list=[64, 128, 256, 512],
-        input_size=(1, 3, 32, 32),
+        input_size=input_size,
         num_classes=num_classes,
         stride_list=[1, 2, 2, 2],
         use_scaler=use_scaler,
@@ -832,19 +838,22 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from hypernet.utils.evaluation import visualize_model_parameters, count_parameters
 import os
-def eval_all_subnets(model: SuperResnet, data_path):
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def eval_all_subnets(model: SuperResnet, data_path, csv_path):
 
     trainData, valData, testData = get_datasets("cifar10", os.path.join(data_path, "cifar10"))
     train_set, val_set, test_set = trainData, valData, testData
 
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=128, shuffle=True, num_workers=5)
     val_loader = torch.utils.data.DataLoader(val_set, batch_size=128, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False, num_workers=5)
 
     def fine_tuning(m):
         m.train()
         with torch.no_grad():
-            for data in test_loader:
+            for data in train_loader:
                 images, labels = data
                 images, labels = images.cuda(), labels.cuda()
                 outputs = m(images)
@@ -885,53 +894,237 @@ def eval_all_subnets(model: SuperResnet, data_path):
         return model_size, accuracy
 
     all_subnet_configs = model.generate_all_subnet_configs()
-    all_subnet_configs.reverse()
+    # all_subnet_configs.reverse()
     results = []
-    for subnet_config in all_subnet_configs:
+
+    def evaluate_subnet(subnet_config, model):
+
         print(subnet_config)
         subnet = model.get_subnet(subnet_config)
         fine_tuning(subnet)
         model_size, accuracy = test(subnet)
-        results.append((model_size, accuracy))
+        return model_size, accuracy, subnet_config
 
-    sizes, accuracies = zip(*results)
-    pd.DataFrame({
-        "size": sizes,
-        "acc": accuracies,
-        "subnet_configs": all_subnet_configs
-    }).to_csv('result.csv')
+    # for subnet_config in all_subnet_configs:
+    #     print(subnet_config)
+    #     subnet = model.get_subnet(subnet_config)
+    #     fine_tuning(subnet)
+    #     model_size, accuracy = test(subnet)
+    #     results.append((model_size, accuracy))
+    max_workers = 5
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(evaluate_subnet, config, model) for config in all_subnet_configs]
+        for future in as_completed(futures):
+            try:
+                model_size, accuracy, subnet_config = future.result(timeout=10)
 
-    plt.scatter(sizes, accuracies)
-    plt.xlabel('Model Size (MB)')
-    plt.ylabel('Accuracy (%)')
-    plt.title('Model Size vs Accuracy')
+                # 单条结果转为 DataFrame
+                df = pd.DataFrame([{
+                    "size": model_size,
+                    "acc": accuracy,
+                    "subnet_configs": str(subnet_config)
+                }])
+
+                # 追加写入 CSV（header=False 表示不重复写表头）
+                df.to_csv(csv_path, mode='a', header=not os.path.exists(csv_path))
+
+                results.append((model_size, accuracy, subnet_config))
+
+            except Exception as e:
+                print(f"Task failed: {e}")
+    # print("saving results...")
+    # sizes, accuracies, configs = zip(*results)
+    # pd.DataFrame({
+    #     "size": sizes,
+    #     "acc": accuracies,
+    #     "subnet_configs": configs
+    # }).to_csv('resnet_result.csv')
+
+    # plt.scatter(sizes, accuracies)
+    # plt.xlabel('Model Size (MB)')
+    # plt.ylabel('Accuracy (%)')
+    # plt.title('Model Size vs Accuracy')
+    # plt.show()
+
+
+
+import matplotlib.pyplot as plt
+
+def plot_mapp_histograms(mapps, labels, colors=None, title="Frequency of Subnet Configurations",
+                         xlabel="Subnet Configurations", ylabel="Frequency",
+                         rotation=90, figsize=(20, 8), legend_loc='upper right'):
+    """
+    绘制多个 mapp 的条形图，用不同颜色区分，并简化 x 轴标签。
+    """
+
+    if not mapps or not isinstance(mapps, list):
+        raise ValueError("mapps 必须是非空列表")
+
+    if colors is None:
+        colors = [f"C{i}" for i in range(len(mapps))]
+
+    if len(colors) < len(mapps):
+        raise ValueError("colors 列表长度必须大于等于 mapps 列表长度")
+
+    fig, ax = plt.subplots(nrows=4, figsize=figsize)
+
+    x_array = np.arange(len(mapps[0].keys()))
+    bar_width = 0.2
+    positions = x_array*bar_width
+    all_values = []
+    # 自动设置 y 轴范围
+    max_value = 0
+
+    for idx, (mapp, color) in enumerate(zip(mapps, colors)):
+        values = list(mapp.values())
+        _sum_times = sum(values)
+        all_values.append(values)
+        values = np.log(np.array(values) + 1)
+        max_value = max(max_value, max(values))
+        _sum_zero = len(values) - np.count_nonzero(values)
+        ax[idx].text(0.2, 8.0, F'#Searched: {_sum_times}')
+        ax[idx].text(0.2, 9.0, F'#Zero Searched: {_sum_zero}')
+        ax[idx].bar(positions, values, width=bar_width, color=color, label=f"{labels[idx]}")
+        ax[idx].set_xticks([])
+        ax[idx].legend(loc=legend_loc)
+        ax[idx].set_ylabel(ylabel)
+        ax[idx].set_ylim(0, 10)
+    # 隐藏 x 轴标签和刻度
+
+    # plt.xlim(0, len(x_array) - bar_width * (len(mapps) - 1))
+    # 设置其他图形属性
+    plt.xlabel("Different Subnet Configurations")
+    fig.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(f'frequency.pdf')
     plt.show()
 
 
 if __name__ == '__main__':
     from torchinfo import summary
     # from heterofl.src.models.resnet import ResNet, Block
+    from itertools import cycle
 
+    batch_size = 128
+    sample_sum = [805, 800, 800, 800, 800, 4002, 4003, 7991, 19999]
+    # client_arch_lists = torch.load("../../logs/cifar10/seed4321/client_config")
+    resnet = super_resnet18(True, False, [1.0, 0.75, 0.5, 0.25], 10)#.cuda()
+    mapp = {}
+    resnet.get_progressive_subnet_configs("depth")
+    for subnet in resnet.generate_all_subnet_configs():
+        mapp[str(subnet)] = 0
+    # mapp2 = mapp.copy()
+    # mapp3 = mapp.copy()
+    # mapp4 = mapp.copy()
+    # for i in range(50):
+    #     for j, arch_list in enumerate(client_arch_lists.values()):
+    #         arch_config = random.choice(arch_list)
+    #         subnet = resnet.get_subnet(arch_config)
+    #         for k in range(sample_sum[j]//batch_size):
+    #             mapp[str(arch_config)] += 1
+    #             subnet_configs = subnet.get_progressive_subnet_configs(A=5)
+    #
+    #             for subnet_config in subnet_configs:
+    #                 mapp[str(subnet_config)] += 1
+    #
+    # for i in range(50):
+    #     for j, arch_list in enumerate(client_arch_lists.values()):
+    #         arch_config = resnet.random_sample_subnet_config(arch_list[-1])
+    #         subnet = resnet.get_subnet(arch_config)
+    #         for k in range(sample_sum[j] // batch_size):
+    #             mapp2[str(arch_config)] += 1
+    #             subnet_configs = []
+    #             for _ in range(10):
+    #                 subnet_config = subnet.random_sample_subnet_config()
+    #                 if subnet_config not in subnet_configs:
+    #                     subnet_configs.append(subnet_config)
+    #             subnet_configs = subnet_configs[:3]
+    #             for subnet_config in subnet_configs:
+    #                 mapp2[str(subnet_config)] += 1
+    #
+    #
+    # for i in range(50):
+    #     for j, arch_list in enumerate(client_arch_lists.values()):
+    #         arch_config = random.choice(arch_list)
+    #         subnet = resnet.get_subnet(arch_config)
+    #         for k in range(sample_sum[j]//batch_size):
+    #             mapp3[str(arch_config)] += 1
+    #             subnet_configs = []
+    #             for _ in range(10):
+    #                 subnet_config = subnet.random_sample_subnet_config()
+    #                 if subnet_config not in subnet_configs:
+    #                     subnet_configs.append(subnet_config)
+    #             subnet_configs = subnet_configs[:3]
+    #             for subnet_config in subnet_configs:
+    #                 mapp3[str(subnet_config)] += 1
+    #
+    # for i in range(50):
+    #     for j, arch_list in enumerate(client_arch_lists.values()):
+    #         arch_config = random.choice(arch_list)
+    #         subnet = resnet.get_subnet(arch_config)
+    #         for k in range(sample_sum[j]//batch_size):
+    #             mapp4[str(arch_config)] += 1
+    #             subnet_configs = []
+    #             last_subnet_config = None
+    #             for _ in range(3):
+    #                 subnetwork_config = subnet.random_sample_subnet_config(last_subnet_config)
+    #                 if subnetwork_config not in subnet_configs:
+    #                     subnet_configs.append(subnetwork_config)
+    #                     last_subnet_config = subnetwork_config
+    #             for subnet_config in subnet_configs:
+    #                 mapp4[str(subnet_config)] += 1
+    #
+    # for i in range(50):
+    #     for j, arch_list in enumerate(client_arch_lists.values()):
+    #         arch_config = random.choice(arch_list)
+    #         subnet = resnet.get_subnet(arch_config)
+    #         for k in range(sample_sum[j]//batch_size):
+    #             mapp[str(arch_config)] += 1
+    #             subnet_configs = subnet.get_progressive_subnet_configs(A=3)
+    #             for idx in subnet_configs:
+    #                 mapp[str(idx)] += 1
 
+    # print(sum(mapp3.values()))
+    # print(sum(mapp4.values()))
+    # print(sum(mapp.values()))
+    mapps = torch.load("mapps")
+    plot_mapp_histograms([mapps[0], mapps[2], mapps[1], mapp], [
+        'Random Sampling + Random Sampling',
+        "Maximum Sampling + Recursive Sampling",
+        'Maximum Sampling + Random Sampling',
+        "Maximum Sampling + Dynamic Weighted Sampling"
+    ], ['#2D8C5E', '#B8B85E', '#4A8C98', '#D1507D'])
+    # plot_mapp_histograms([mapp2], ['Random Sampling + Random Sampling'], ['g'])
+    # plot_mapp_histograms([mapps[1]], ['Maximum Sampling + Random Sampling'], 'y')
+    # plot_mapp_histograms([mapps[2]], ["Maximum Sampling + Recursive Sampling"], 'b')
+    # plot_mapp_histograms([mapps[3]], ["Maximum Sampling + Dynamic Weighted Sampling"], 'r')
+    # torch.save([mapp2, mapps[1], mapps[2], mapps[3]], "mapps")
+    # plot_mapp_histograms(torch.load("mapps"))
+    # import os
 
-    resnet = super_resnet50(True, False, [1, 0.75, 0.5, 0.25]).cuda()
-    import os
-
-    data_shares = [.1, .1, .1, .1, .1, .5]
-    trainData, valData, testData = load_cifar("cifar100", os.path.join("../../../data", "cifar100"),
-                                              data_shares, 0.5, 1)
-    idx_dataset = -1
-    train_set, val_set, test_set = trainData[idx_dataset], valData[idx_dataset], testData[idx_dataset]
-    print(resnet)
-
-    summary(resnet, input_size=(128, 3, 32, 32))
-    # 损失函数
-    optimizer = torch.optim.SGD(resnet.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
-    criterion = nn.CrossEntropyLoss()
-    # dataloader
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=128, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_set, batch_size=128, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False)
+    # data_shares = [.1, .1, .1, .1, .1, .5]
+    # trainData, valData, testData = load_cifar("cifar10", os.path.join("../../../data", "cifar10"),
+    #                                           data_shares, 1, 1)
+    #
+    # for idx, trainset in enumerate(trainData):
+    #     class_distribution = np.zeros(10)
+    #     for _, labels in trainset:
+    #         class_distribution[labels] += 1
+    #     class_distribution = class_distribution / np.sum(class_distribution)
+    #     print(f'Client {idx} class distribution:', class_distribution)
+    # idx_dataset = -1
+    # train_set, val_set, test_set = trainData[idx_dataset], valData[idx_dataset], testData[idx_dataset]
+    # print(resnet)
+    #
+    # summary(resnet, input_size=(128, 3, 32, 32))
+    # # 损失函数
+    # optimizer = torch.optim.SGD(resnet.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
+    # criterion = nn.CrossEntropyLoss()
+    # # dataloader
+    # train_loader = torch.utils.data.DataLoader(train_set, batch_size=128, shuffle=True)
+    # val_loader = torch.utils.data.DataLoader(val_set, batch_size=128, shuffle=False)
+    # test_loader = torch.utils.data.DataLoader(test_set, batch_size=128, shuffle=False)
 
 
     def test(model, active_path=None):
@@ -1001,13 +1194,38 @@ if __name__ == '__main__':
                 # visualize_model_parameters(model.hidden_layer.state_dict(), figsize=(10, 8))
 
 
-    train(resnet, epochs=10)
-    test(resnet)
-    for i in range(10):
-        subnet_config = resnet.random_sample_subnet_config()
-        test(resnet, subnet_config)
-        subnet1 = resnet.get_subnet(subnet_config)
-        test(subnet1)
+    # subnet_config = resnet.random_sample_subnet_config()
+    # width = 0.8
+    # subnet1 = resnet.get_subnet(
+    #     {
+    #         "sublayer_0": {
+    #             "block_0": width,
+    #             "block_1": width
+    #         },
+    #         "sublayer_1": {
+    #             "block_0": width,
+    #             "block_1": width
+    #         },
+    #         "sublayer_2": {
+    #             "block_0": width,
+    #             "block_1": width
+    #         },
+    #         # "sublayer_3": {
+    #         #     "block_0": width,
+    #         #     "block_1": width
+    #         # }
+    #     }
+    # )
+    # print(count_parameters(subnet1))
+    # 5.31 7,0.86
+    #
+    # train(resnet, epochs=10)
+    # test(resnet)
+    # for i in range(10):
+    #     subnet_config = resnet.random_sample_subnet_config()
+    #     test(resnet, subnet_config)
+    #     subnet1 = resnet.get_subnet(subnet_config)
+    #     test(subnet1)
 
 
 

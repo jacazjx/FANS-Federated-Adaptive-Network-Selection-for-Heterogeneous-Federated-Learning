@@ -68,68 +68,28 @@ def main(args):
         args.device = torch.device(args.device)
 
     model_configs = {
-        "depthfl": {
-            "small":    ["1_2_1"],
-            "medium":   ["2_2_1"],
-            "large":    ["3_2_1"],
-            "server":   ["4_2_1"]
-        },
-        "heterofl": {
-            "small":    ["4_2_0.125"],
-            "medium":   ["4_2_0.25"],
-            "large":    ["4_2_0.5"],
-            "server":   ["4_2_1"]
-        },
-        "scalefl": {
-            "small":    ["1_2_0.25"],
-            "medium":   ["2_2_0.5"],
-            "large":    ["3_2_0.75"],
-            "server":   ["4_2_1"]
-        },
         "fans": {               #DepthFL,  HeteroFL ,  ScaleFL
-            "small":    0.125,  #["1_2_1", "4_2_0.25", "1_2_0.25"],
-            "medium":   0.25,   #["2_2_1", "4_2_0.5",  "2_2_0.5"],
-            "large":    0.5,    #["3_2_1", "4_2_0.75", "3_2_0.75"],
-            "server":   1       #["4_2_1"]
-        },
-        "standalone": {
-            "small":    ["1_2_0.25"],
-            "medium":   ["2_2_0.5"],
-            "large":    ["3_2_0.75"],
-            "server":   ["4_2_1"]
+            "small":    0.125,  #["1_2_1", "4_2_0.25", "1_2_0.25"   ],
+            "medium":   0.25,   #["2_2_1", "4_2_0.5",  "2_2_0.5"    ],
+            "large":    0.5,    #["3_2_1", "4_2_0.75", "3_2_0.75"   ],
+            "server":   1       #["4_2_1", "4_2_1",    "4_2_1"      ]
         },
     }
 
-    if args.task == 'cifar10':
-        args.client_model_configs = {}
-        # server
-        idx = 0
-        for name, num in device_distribution.items():
-            for _ in range(num):
-                args.client_model_configs[idx] = model_configs[args.algorithm][name]
-                idx += 1
-
-    elif args.task == 'cifar100':
-        args.client_model_configs = {}
-        # server
-        idx = 0
-        for name, num in device_distribution.items():
-            for _ in range(num):
-                args.client_model_configs[idx] = model_configs[args.algorithm][name]
-                idx += 1
-    elif args.task == 'mnli':
-        args.client_model_configs = {}
-        # server
-        idx = 0
-        for name, num in device_distribution.items():
-            for _ in range(num):
-                args.client_model_configs[idx] = model_configs[args.algorithm][name]
-                idx += 1
+    args.client_model_configs = {}
+    # server
+    idx = 0
+    for name, num in device_distribution.items():
+        for _ in range(num):
+            args.client_model_configs[idx] = model_configs[args.algorithm][name]
+            idx += 1
 
     args.metrics = ['ACC']
 
     if args.task == 'cifar10':
         args.n_class = 10
+    elif args.task == 'imagenet':
+        args.n_class = 1000
     elif args.task == 'cifar100':
         args.n_class = 100
     elif args.task == 'mnist':
@@ -168,7 +128,7 @@ def parse_args():
     parser.add_argument('--buffer_size', type=int, default=1048576)
     parser.add_argument('--timeout', type=int, default=7200)
     # configuration
-    parser.add_argument('-t', '--task', choices=['cifar10', 'cifar100', 'mnist', 'mnli'], default='cifar10',
+    parser.add_argument('-t', '--task', choices=['cifar10', 'cifar100', 'mnist', 'mnli', 'imagenet'], default='cifar10',
                         help="task name")
     # parser.add_argument('--scaling', choices=['width', 'depth', '2d'], default='width',
     #                     help="model scaling strategy. P.S. this is not used in our code")
@@ -191,7 +151,7 @@ def parse_args():
     parser.add_argument('--warm_up', action='store_true', help="warm up")
     # parser.add_argument('--runtime_random', action='store_true', help="random choice model config at runtime")
     # model name
-    parser.add_argument('--algorithm', type=str, choices=["scalefl", "depthfl", "fans", "heterofl", "standalone"], default="fans",
+    parser.add_argument('--algorithm', type=str, choices=["fans"], default="fans",
                         help="algorithms")
 
     # model parameter
@@ -202,11 +162,12 @@ def parse_args():
 
     parser.add_argument('--node_hid', type=int, default=128, help="node embedding dimension")
     parser.add_argument('--trs', type=bool, default=True, help="whether track the running_mean and running_var")
-    parser.add_argument('--subnet_way', type=str, default="none", choices=['none', 'l1'],
-                        help="whether track the running_mean and running_var")
+    parser.add_argument('--sample_way', type=int, default=0, choices=[0, 1, 2],
+                        help="sample way: 0 for IndepdentRandomSample, 1 for RecursiveRandomSample, 2 for WeightedRandomSample")
+    parser.add_argument('--num_sample', type=int, default=3,
+                    help="It means the number of sampling subnetworks. This is activate when sample_way is IRS or WRS. ")
 
-
-    parser.add_argument('--round_alpha', type=float, default=1, help="proportion of rounds for stage 1")
+    parser.add_argument('--round_alpha', type=float, default=0.8, help="proportion of rounds for stage 1")
     parser.add_argument('--round_beta', type=float, default=0, help="proportion of rounds for stage 2")
     return parser.parse_args()
 
@@ -222,8 +183,16 @@ if __name__ == '__main__':
         args.momentum = 0.9
         args.weight_decay = 1e-4
         args.width_ratio_list = [1, 0.75, 0.5, 0.25]
+    elif args.task == 'imagenet':
+        args.rounds = 50
+        args.batch_size = 128
+        args.epochs = 5
+        args.lr = 0.1
+        args.momentum = 0.9
+        args.weight_decay = 1e-4
+        args.width_ratio_list = [1, 0.75, 0.5, 0.25]
     elif args.task == 'cifar100':
-        args.rounds = 500
+        args.rounds = 100
         args.batch_size = 128
         args.epochs = 5
         args.lr = 0.1
@@ -232,9 +201,9 @@ if __name__ == '__main__':
         args.width_ratio_list = [1, 0.5]
     elif args.task == 'mnli':
         args.rounds = 50
-        args.batch_size = 128
+        args.batch_size = 32
         args.epochs = 1
-        args.lr = 3e-5
+        args.lr = 2e-5
         args.momentum = 0.9
         args.weight_decay = 1e-4
         args.width_ratio_list = [1, 0.75, 0.5, 0.25]
@@ -244,11 +213,16 @@ if __name__ == '__main__':
         args.n_large = (1, 20)
         args.n_medium = (2, 10)
         args.n_small = (5, 2)
+    elif args.task == 'imagenet':
+        args.n_full = (1, 30)
+        args.n_large = (1, 10)
+        args.n_medium = (5, 10)
+        args.n_small = (10, 1)
     elif args.task == 'cifar100':
-        args.n_full = (1, 50)
-        args.n_large = (2, 5)
-        args.n_medium = (5, 2)
-        args.n_small = (30, 1)
+        args.n_full = (1, 10)
+        args.n_large = (4, 5)
+        args.n_medium = (10, 2)
+        args.n_small = (50, 1)
     elif args.task == 'mnli':
         args.n_full = (1, 50)
         args.n_large = (2, 10)
@@ -258,40 +232,16 @@ if __name__ == '__main__':
 
     args.total_clients = args.n_full[0] + args.n_large[0] + args.n_medium[0] + args.n_small[0]
 
-    if args.algorithm == 'heterofl':
-        args.fed_dyn = False
-        args.width_ratio_list = [1, 0.5, 0.25, 0.125]
-        args.batch_size = 16
-        args.use_scaler = True
-        args.trs = False
-    elif args.algorithm == 'depthfl':
-        args.fed_dyn = True
-        args.dyn_alpha = 0.1
-        args.width_ratio_list = [0]
-        args.use_scaler = False
-        args.trs = True
-    elif args.algorithm == 'scalefl':
-        args.fed_dyn = False
-        args.use_scaler = True
-        args.width_ratio_list = [1, 0.5, 0.5, 0.125]
-        args.round_alpha = 0.25
-        args.round_beta = 0.75
-        args.trs = False
-    elif args.algorithm == 'fans':
+    if args.algorithm == 'fans':
         args.fed_dyn = False
         args.warm_up = False
         args.dyn_alpha = 0.1
-        args.temp = 1
-        args.beta = 0.6
-        args.round_alpha = 0
+        args.temp = 5
+        args.beta = 1.0
         args.round_beta = 1
         args.use_scaler = False
         args.trs = True
-    else:
-        args.fed_dyn = False
-        args.width_ratio_list = [1, 0.5, 0.25, 0.125]
-        args.use_scaler = False
-        args.trs = True
+
 
     client_clusters = [(args.client_ip, int(p)) for p in args.cp]
 

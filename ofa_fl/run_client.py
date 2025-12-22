@@ -13,7 +13,7 @@ from client import ClientCluster
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--data_dir', type=str, default="../data")
+    parser.add_argument('--data_dir', type=str, default="../../Datasets")
     parser.add_argument('--device', choices=['cuda', 'cpu'], help="use cuda or cpu")
     parser.add_argument('-g', '--gpu', type=int, default="0", help="gpu id")
     parser.add_argument('--port', type=int, default=12345)
