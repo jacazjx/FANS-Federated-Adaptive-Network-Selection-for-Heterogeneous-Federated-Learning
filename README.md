@@ -1,6 +1,6 @@
 # FANS
 
-FANS: Federated Adaptive Network Selection for Heterogeneous Federated Learning. ICML 2025. 
+FANS: Federated Adaptive Network Search for Heterogeneous Federated Learning.
 [[paper]( )][[video]( )]
 
 ## Run Experiments
